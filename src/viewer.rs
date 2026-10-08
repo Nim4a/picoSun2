@@ -227,16 +227,53 @@ impl App {
     }
 
     /// Wheel paging, session contract: one notch = one photo, hard stop at
-    /// edges, burst banks to one page.
+    /// edges. Each notch moves instantly on the cached tile; the full master
+    /// decodes only once the wheel settles (see update()).
     fn wheel(&mut self, delta: i32) {
         if self.folder.len() < 2 {
             return;
         }
-        if self.banked == 0 {
-            self.step(delta.signum()); // first notch moves instantly
-        }
+        self.wheel_step(delta.signum());
         self.banked += delta;
         self.last_notch = Instant::now();
+    }
+
+    /// Light step: move the index and show the cached tile now (~0ms).
+    /// No master decode here — the settle handler queues exactly one.
+    fn wheel_step(&mut self, delta: i32) {
+        let n = self.folder.len() as i32;
+        let next = (self.index as i32 + delta).clamp(0, n - 1) as usize;
+        if next == self.index {
+            return; // hard stop at folder edges
+        }
+        self.index = next;
+        self.error = None;
+        if !self.zoom.locked {
+            self.zoom.mode = ZoomMode::Fit;
+        }
+        let p = self.folder[self.index].clone();
+        if !self.thumbs.contains_key(&p) {
+            self.queue_thumb(p.clone());
+        } else if let Some(tile) = self.thumbs.get(&p).cloned() {
+            // instant feedback: show the tile until the master lands
+            self.prev_tex = None;
+            self.tex = Some(tile);
+            self.fade = None;
+        }
+    }
+
+    /// Queue exactly one master decode for wherever the wheel settled.
+    fn settle_master(&mut self) {
+        let Some(p) = self.current().map(|p| p.to_path_buf()) else { return };
+        if self.decoding.as_deref() == Some(p.as_path()) {
+            return; // already in flight
+        }
+        self.decoding = Some(p.clone());
+        let tx = self.master_tx.clone();
+        rayon::spawn(move || {
+            let img = read_image(&p);
+            let _ = tx.send((p, img));
+        });
     }
 
     /// Take tiles and masters off their worker channels; upload as textures.
@@ -417,10 +454,11 @@ impl eframe::App for App {
         self.last_ctx = Some(ctx.clone()); // retexture() needs it between frames
         self.poll_decode(ctx);
 
-        // settle: burst over → banked only tracks that a burst happened;
-        // steps already landed per notch in wheel(), so just clear it
+        // settle: wheel quiet → decode the master for wherever we landed.
+        // Steps already moved per-notch on cached tiles; exactly one master.
         if self.banked != 0 && self.last_notch.elapsed() >= SETTLE {
             self.banked = 0;
+            self.settle_master();
         }
 
         // input: fullscreen / pages / zoom / pan
