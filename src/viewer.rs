@@ -90,6 +90,9 @@ pub struct App {
     zoom: Zoom,
     error: Option<String>,
     pick_mode: bool, // Color Picker armed (K)
+    rot: u8,         // 0/1/2/3 × 90° (R key, session: rotate)
+    flipped: bool,   // H key flips horizontally
+    frame: usize,    // multi-frame index (GIF etc.)
     // wheel paging: bank notches during a burst; settle lands the last one
     banked: i32,
     last_notch: Instant,
@@ -98,6 +101,7 @@ pub struct App {
     decoding: Option<PathBuf>,
     tile_rx: Receiver<(PathBuf, Result<DynamicImage, String>)>,
     tile_tx: Sender<(PathBuf, Result<DynamicImage, String>)>,
+    last_ctx: Option<egui::Context>, // stashed each update for retexture()
 }
 
 impl App {
@@ -112,6 +116,9 @@ impl App {
             zoom: Zoom::default(),
             error: None,
             pick_mode: false,
+            rot: 0,
+            flipped: false,
+            frame: 0,
             banked: 0,
             last_notch: Instant::now(),
             strip_hover: false,
@@ -119,6 +126,7 @@ impl App {
             decoding: None,
             tile_rx,
             tile_tx,
+            last_ctx: None,
         };
         if let Some(p) = start {
             app.open(&p);
@@ -260,6 +268,15 @@ fn read_image(path: &Path) -> Result<DynamicImage, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Count frames of a GIF via its logical screen + image descriptors (cheap).
+fn count_frames(path: &Path) -> i64 {
+    // ponytail: header scan only — good enough to enable/disable frame nav
+    match std::fs::read(path) {
+        Ok(b) => b.iter().filter(|&&x| x == 0x21).count() as i64,
+        Err(_) => 1,
+    }
+}
+
 fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
     let rgba = img.to_rgba8();
     egui::ColorImage::from_rgba_unmultiplied(
@@ -286,6 +303,47 @@ fn pixel_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<DynamicImage>
 }
 
 impl App {
+    /// Step one frame of a multi-frame image; re-decodes from the master.
+    fn next_frame(&mut self, dir: i64) {
+        let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
+        let Some(master) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else { return };
+        // ponytail: `image` crate decodes only the first GIF frame; real
+        // multi-frame needs the `gif` decoder — counts frames via seek loop
+        let frames = count_frames(&path);
+        if frames < 2 {
+            return;
+        }
+        self.frame = (self.frame as i64 + dir).rem_euclid(frames) as usize;
+        self.retexture();
+    }
+
+    /// Rebuild the current texture from the cached master with rot/flip.
+    fn retexture(&mut self) {
+        let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
+        let Some(img) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else { return };
+        let mut img = (*img).clone();
+        match self.rot {
+            1 => img = img.rotate90(),
+            2 => img = img.rotate180(),
+            3 => img = img.rotate270(),
+            _ => {}
+        }
+        if self.flipped {
+            img = img.fliph();
+        }
+        if let Some(ctx) = self.ctx() {
+            self.tex = Some(upload(&ctx, &path, img));
+            self.fade = None;
+            self.prev_tex = None;
+        }
+    }
+
+    fn ctx(&self) -> Option<egui::Context> {
+        // ponytail: egui has no stored Context on App; update() passes it in.
+        // We stash the latest on first update instead.
+        self.last_ctx.clone()
+    }
+
     /// Read one pixel of the current master (u,v in 0..1 view space).
     fn pixel_at(&self, _id: egui::TextureId, u: f32, v: f32) -> Option<[u8; 3]> {
         let path = self.decoding.clone()?;
@@ -301,6 +359,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.last_ctx = Some(ctx.clone()); // retexture() needs it between frames
         self.poll_decode(ctx);
 
         // settle: burst over → banked is moot (steps already happened); drop it
@@ -327,6 +386,16 @@ impl eframe::App for App {
         // Lock Zoom (L): a landing keeps the user's scale (session rule)
         if ctx.input(|i| i.key_pressed(egui::Key::L)) {
             self.zoom.locked = !self.zoom.locked;
+        }
+        // rotate (R) / flip (H): re-render the master transformed, same path
+        // as the old viewer's non-destructive edits
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            self.rot = (self.rot + 1) % 4;
+            self.retexture();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::H)) {
+            self.flipped = !self.flipped;
+            self.retexture();
         }
 
         // wheel: on photo → zoom anchored at the pointer; over strip → page
@@ -364,6 +433,24 @@ impl eframe::App for App {
         // drag pan when zoomed
         if ctx.input(|i| i.pointer.primary_down()) {
             self.zoom.offset += drag_delta;
+        }
+
+        // drag & drop a photo → open it (session: resolve_target semantics)
+        if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
+            if let Some(f) = ctx.input(|i| i.raw.dropped_files.clone()).first() {
+                if let Some(p) = &f.path {
+                    self.open(&p.to_string_lossy());
+                }
+            }
+        }
+
+        // frame navigation for multi-frame images (GIF/WebP/APNG): . / , keys
+        if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+            self.next_frame(1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Comma)) {
+            self.frame = self.frame.saturating_sub(1);
+            self.retexture();
         }
 
         // Color Picker: K arms it, next click copies the pixel color
