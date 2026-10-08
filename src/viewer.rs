@@ -132,8 +132,8 @@ pub struct App {
     decoding: Option<PathBuf>,
     tile_rx: Receiver<(PathBuf, Result<Arc<DynamicImage>, String>)>,
     tile_tx: Sender<(PathBuf, Result<Arc<DynamicImage>, String>)>,
-    master_rx: Receiver<(PathBuf, Result<Arc<DynamicImage>, String>)>,
-    master_tx: Sender<(PathBuf, Result<Arc<DynamicImage>, String>)>,
+    master_rx: Receiver<(PathBuf, Result<egui::ColorImage, String>)>,
+    master_tx: Sender<(PathBuf, Result<egui::ColorImage, String>)>,
     master_tex: Vec<(PathBuf, egui::TextureHandle)>, // uploaded masters, LRU-8
     info_size: u64, // file size for the info bar: stat once, not per frame
     last_ctx: Option<egui::Context>, // stashed each update for retexture()
@@ -359,10 +359,17 @@ impl App {
             match res {
                 Ok(img) => {
                     let tex = upload(ctx, &path, &img);
-                    // tile for the photo we're now on = instant feedback while
-                    // its master still decodes (cold cache showed nothing)
+                    // tile for the photo we're now on = instant feedback:
+                    // show it unless the full master is already on screen
+                    // (the old gate on `decoding` hid tiles during the whole
+                    // notch→settle window — the slow-scroll lag)
                     let is_current = self.current() == Some(path.as_path());
-                    if is_current && self.decoding.is_some() && self.fade.is_none() {
+                    let master_shown = self.tex.as_ref().map_or(false, |t| {
+                        self.master_tex
+                            .iter()
+                            .any(|(p, h)| *p == path && h.id() == t.id())
+                    });
+                    if is_current && !master_shown && self.fade.is_none() {
                         self.prev_tex = None;
                         self.tex = Some(tex.clone());
                     }
@@ -377,8 +384,10 @@ impl App {
                 continue;
             }
             match res {
-                Ok(img) => {
-                    let tex = upload_master(ctx, &path, img);
+                Ok(cimg) => {
+                    // conversion happened on the worker; this is GPU upload only
+                    let tex =
+                        ctx.load_texture(path.display().to_string(), cimg, Default::default());
                     self.put_master(path.clone(), tex.clone());
                     // crossfade: old photo stays on top and fades OUT
                     self.prev_tex = self.tex.take();
@@ -395,11 +404,13 @@ impl App {
     }
 }
 
-/// Masters decode on their OWN single thread: a thumb storm on the global
-/// pool must never delay the landing sharpen (session: instant-first).
+/// Masters decode AND convert on their own single thread: the RGB→RGBA
+/// conversion of a 12MP photo (~48MB) used to hitch the UI thread for
+/// 40-80ms on every landing; only the GPU upload stays on the UI side.
+/// A thumb storm on the global pool can also never delay this decode.
 fn spawn_master(
     path: PathBuf,
-    tx: Sender<(PathBuf, Result<Arc<DynamicImage>, String>)>,
+    tx: Sender<(PathBuf, Result<egui::ColorImage, String>)>,
 ) {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     let pool = POOL.get_or_init(|| {
@@ -410,8 +421,19 @@ fn spawn_master(
             .expect("master pool")
     });
     pool.spawn(move || {
-        let img = read_image(&path).map(Arc::new);
-        let _ = tx.send((path, img));
+        match read_image(&path).map(Arc::new) {
+            Ok(arc) => {
+                let cimg = to_color_image(&arc);
+                // pixel cache first: Color Picker / Save are ready on arrival
+                if let Ok(mut c) = pixel_cache().lock() {
+                    c.insert(path.clone(), arc);
+                }
+                let _ = tx.send((path, Ok(cimg)));
+            }
+            Err(e) => {
+                let _ = tx.send((path, Err(e)));
+            }
+        }
     });
 }
 
@@ -615,19 +637,6 @@ fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
 
 fn upload(ctx: &egui::Context, path: &Path, img: &DynamicImage) -> egui::TextureHandle {
     ctx.load_texture(path.display().to_string(), to_color_image(img), Default::default())
-}
-
-/// Master upload: CPU pixels Arc-shared into the cache (no copy), texture
-/// on screen, and the handle also kept by the caller for master_tex.
-fn upload_master(
-    ctx: &egui::Context,
-    path: &Path,
-    img: Arc<DynamicImage>,
-) -> egui::TextureHandle {
-    if let Ok(mut c) = pixel_cache().lock() {
-        c.insert(path.to_path_buf(), img.clone()); // Arc clone = pointer copy
-    }
-    upload(ctx, path, &img)
 }
 
 /// masters cache: decoded DynamicImage per path (session: master_for).
