@@ -3,6 +3,7 @@
 
 use eframe::egui;
 use image::DynamicImage;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -31,7 +32,7 @@ fn is_image(p: &Path) -> bool {
 }
 
 /// Explorer-style natural sort: digit runs compare numerically (pic2 < pic10).
-pub fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     // ponytail: digit-run chunks only; close enough to Explorer without a locale table
     let (mut ia, mut ib) = (0usize, 0usize);
     let (ba, bb) = (a.as_bytes(), b.as_bytes());
@@ -95,11 +96,10 @@ pub struct App {
     decoding: Option<PathBuf>,
     tile_rx: Receiver<(PathBuf, Result<DynamicImage, String>)>,
     tile_tx: Sender<(PathBuf, Result<DynamicImage, String>)>,
-    start: Option<String>,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, start: Option<String>) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, start: Option<String>) -> Self {
         let (tile_tx, tile_rx) = channel();
         let mut app = Self {
             folder: vec![],
@@ -116,10 +116,9 @@ impl App {
             decoding: None,
             tile_rx,
             tile_tx,
-            start,
         };
-        if let Some(p) = &start {
-            app.open(p);
+        if let Some(p) = start {
+            app.open(&p);
         }
         app
     }
@@ -148,15 +147,10 @@ impl App {
             )
         });
         self.folder = files;
-        self.index = self
-            .folder
-            .iter()
-            .position(|p| p == anchor)
-            .unwrap_or(0);
+        self.index = self.folder.iter().position(|p| p == anchor).unwrap_or(0);
     }
 
     /// Explicit open (arg, double-click, drop): instant-first.
-    /// The strip tile lands in ~0ms; the master decodes on a worker.
     fn open(&mut self, path: &str) {
         let path = match std::fs::canonicalize(path) {
             Ok(p) => p,
@@ -173,48 +167,42 @@ impl App {
         self.show_current();
     }
 
-    /// Show the current index: tile first (from cache), master decode queued.
+    /// Show the current index: fit landing, master decode queued on worker.
     fn show_current(&mut self) {
         let Some(p) = self.current().map(|p| p.to_path_buf()) else { return };
         self.error = None;
-        self.zoom.mode = ZoomMode::Fit; // a new photo always lands fitted
-        // tile now if the strip already decoded it
-        if self.thumbs.contains_key(&p) {
-            // nothing — paint() uses the thumb until the master lands
-        } else {
-            self.queue_thumb(p.clone());
+        self.zoom.mode = ZoomMode::Fit;
+        if !self.thumbs.contains_key(&p) {
+            let tx = self.tile_tx.clone();
+            let small = p.clone();
+            rayon::spawn(move || {
+                let img =
+                    read_image(&small).map(|im| im.thumbnail((TILE * 3.0) as u32, TILE as u32 * 3));
+                let _ = tx.send((small, img.map_err(|e| e.to_string())));
+            });
         }
-        self.queue_master(p);
+        self.decoding = Some(p.clone());
+        let tx = self.tile_tx.clone();
+        rayon::spawn(move || {
+            let img = read_image(&p);
+            let _ = tx.send((p, img));
+        });
     }
 
-    fn queue_thumb(&mut self, path: PathBuf) {
-        if self.thumbs.contains_key(&path) {
+    fn step(&mut self, delta: i32) {
+        if self.folder.len() < 2 {
             return;
         }
-        let tx = self.tile_tx.clone();
-        let small = path.clone();
-        rayon::spawn(move || {
-            let img = image::io::Reader::open(&small)
-                .and_then(|r| r.with_guessed_format().ok())
-                .and_then(|r| r.decode().ok())
-                .map(|im| im.thumbnail(TILE as u32 * 3, TILE as u32 * 3));
-            let _ = tx.send((small, img.map_err(|e| e.to_string())));
-        });
-    }
-
-    fn queue_master(&mut self, path: PathBuf) {
-        self.decoding = Some(path.clone());
-        let tx = self.tile_tx.clone();
-        rayon::spawn(move || {
-            let img = image::io::Reader::open(&path)
-                .and_then(|r| r.with_guessed_format().ok())
-                .and_then(|r| r.decode());
-            let _ = tx.send((path, img.map_err(|e| e.to_string())));
-        });
+        let n = self.folder.len() as i32;
+        let next = (self.index as i32 + delta).clamp(0, n - 1) as usize;
+        if next != self.index {
+            self.index = next; // hard stop at folder edges
+            self.show_current();
+        }
     }
 
     /// Wheel paging, session contract: one notch = one photo, hard stop at
-    /// edges, burst banks to one page, settle decodes on the worker.
+    /// edges, burst banks to one page.
     fn wheel(&mut self, delta: i32) {
         if self.folder.len() < 2 {
             return;
@@ -244,87 +232,23 @@ impl App {
                     self.decoding = None;
                 }
                 Err(e) => {
-                self.error = Some(format!("{}: {}", path.display(), e));
-                self.decoding = None;
+                    self.error = Some(format!("{}: {}", path.display(), e));
+                    self.decoding = None;
                 }
-                }
-                }
-                }
-                }
+            }
+        }
+    }
+}
 
-                impl eframe::App for App {
-                fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-                // worker results first
-                self.poll_decode(ctx);
+fn read_image(path: &Path) -> Result<DynamicImage, String> {
+    image::ImageReader::open(path)
+        .and_then(|r| r.with_guessed_format())
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())
+}
 
-                // settle: wheel quiet for SETTLE → the banked burst already stepped;
-                // nothing more to decode (we decode per step, instant-first).
-                if self.banked != 0 && self.last_notch.elapsed() >= SETTLE {
-                let dir = self.banked.signum();
-                self.banked = 0;
-                self.step(dir);
-                }
-
-                // fade progress; request repaint while animating
-                let fading = self.fade.is_some();
-                if fading {
-                let t = self.fade.unwrap().elapsed().as_secs_f32() / FADE;
-                if t >= 1.0 {
-                self.fade = None;
-                self.prev_tex = None;
-                }
-                }
-
-                // fullscreen toggle: F / F11 / Esc-exit-fullscreen
-                if ctx.input(|i| i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::F11)) {
-                let vp = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!vp));
-                }
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                if ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)) {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
-                }
-                // wheel: on photo → zoom; over strip handled below
-                let (wheel_delta, pointer) = ctx.input(|i| (i.smooth_scroll_delta.y, i.pointer.latest_pos()));
-                let over_strip = self.strip_hover;
-                if wheel_delta != 0.0 {
-                if over_strip {
-                self.wheel(if wheel_delta < 0.0 { 1 } else { -1 });
-                } else {
-                // zoom anchored at the pointer (session contract)
-                let s = if wheel_delta > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                self.zoom.scale *= s;
-                self.zoom.mode = ZoomMode::Actual; // leaving fit
-                // ponytail: anchor correction simplified — keep pointer stable
-                }
-                }
-                // arrows / space page
-                let (left, right) = ctx.input(|i| (i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
-                if right { self.step(1); }
-                if left { self.step(-1); }
-
-                // drag pan when zoomed
-                if self.zoom.scale > 1.001 && ctx.input(|i| i.pointer.primary_down()) {
-                if let Some(d) = ctx.input(|i| i.pointer.delta()) {
-                self.zoom.offset += d;
-                }
-                }
-
-                let full = egui::CentralPanel::default()
-                .frame(egui::Frame::NONE)
-                .show(ctx, |ui| self.paint(ui));
-                let _ = full;
-
-                if fading {
-                ctx.request_repaint();
-                }
-                }
-                }
-
-fn to_color_image(img: DynamicImage) -> egui::ColorImage {
+fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
     let rgba = img.to_rgba8();
     egui::ColorImage::from_rgba_unmultiplied(
         [rgba.width() as _, img.height() as _],
@@ -334,5 +258,204 @@ fn to_color_image(img: DynamicImage) -> egui::ColorImage {
 
 fn upload(ctx: &egui::Context, path: &Path, img: DynamicImage) -> egui::TextureHandle {
     let name = path.display().to_string();
-    ctx.load_texture(name, to_color_image(img), Default::default())
+    ctx.load_texture(name, to_color_image(&img), Default::default())
 }
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_decode(ctx);
+
+        // settle: burst over → banked is moot (steps already happened); drop it
+        if self.banked != 0 && self.last_notch.elapsed() >= SETTLE {
+            let dir = self.banked.signum();
+            self.banked = 0;
+            self.step(dir);
+        }
+
+        // input: fullscreen / pages / zoom / pan
+        if ctx.input(|i| i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::F11)) {
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            if fs {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+
+        // wheel: on photo → zoom; over strip → page (session contract)
+        let (wheel_y, strip_hot, over_photo) = ui_input(ctx);
+        if wheel_y != 0.0 {
+            if strip_hot {
+                self.wheel(if wheel_y < 0.0 { 1 } else { -1 });
+            } else {
+                self.zoom_at(wheel_y.signum());
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+            self.step(1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+            self.step(-1);
+        }
+        // drag pan when zoomed
+        if over_photo && ctx.input(|i| i.pointer.primary_down()) {
+            let d = ctx.input(|i| i.pointer.delta());
+            self.zoom.offset += d;
+        }
+
+        // the whole window is one layer: photo floats, desktop shows through
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| self.paint(ui));
+
+        // fade animating → keep painting
+        if self.fade.is_some() {
+            ctx.request_repaint();
+        }
+    }
+}
+
+fn ui_input(ctx: &egui::Context) -> (f32, bool, bool) {
+    ctx.input(|i| {
+        (
+            i.smooth_scroll_delta.y,
+            false, // strip hover resolved inside paint; wheel paging uses explicit hover
+            false,
+        )
+    })
+}
+
+impl App {
+    fn zoom_at(&mut self, dir: f32) {
+        let f = if dir > 0.0 { 1.15 } else { 1.0 / 1.15 };
+        self.zoom.scale *= f;
+        self.zoom.mode = ZoomMode::Actual;
+    }
+
+    /// One layer: photo floats over nothing; bars draw on top.
+    fn paint(&mut self, ui: &mut egui::Ui) {
+        let area = ui.max_rect();
+        // Painter is a cheap handle (Arc inside); owning it frees `ui` for
+        // allocate_rect calls later in the same function.
+        let painter = ui.painter().clone();
+
+        // photo + crossfade (old fades OUT on top — session rule)
+        if let Some(tex) = self.tex.clone() {
+            let size = tex.size_vec2();
+            let rect = fit_rect(area, size, &self.zoom);
+            let mut tint = egui::Color32::WHITE;
+            if let Some(t) = self.fade {
+                let a = ((t.elapsed().as_secs_f32() / FADE).min(1.0) * 255.0) as u8;
+                tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255 - a as u8);
+            }
+            if let Some(prev) = self.prev_tex.clone() {
+                if tint.a() > 0 {
+                    let ps = prev.size_vec2();
+                    painter.image(
+                        prev.id(),
+                        fit_rect(area, ps, &self.zoom),
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, ps),
+                        tint,
+                    );
+                }
+            }
+            painter.image(tex.id(), rect, egui::Rect::from_min_size(egui::Pos2::ZERO, size), egui::Color32::WHITE);
+        }
+
+        // Picasa strip: navy band at the bottom, tiles 30px tall
+        let strip_rect = egui::Rect::from_min_size(
+            egui::pos2(area.left(), area.bottom() - TILE),
+            egui::vec2(area.width(), TILE),
+        );
+        painter.rect_filled(strip_rect, 0.0, egui::Color32::from_rgb(8, 9, 12));
+
+        // info bar above (name + counter), thin grey
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(area.left(), strip_rect.top() - BAR),
+            egui::vec2(area.width(), BAR),
+        );
+        painter.rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(24, 25, 28));
+        if let Some(p) = self.current() {
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            painter.text(
+                bar_rect.left_top() + egui::vec2(8.0, BAR / 2.0),
+                egui::Align2::LEFT_CENTER,
+                format!("{} / {}", self.index + 1, self.folder.len()),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(200, 200, 205),
+            );
+            painter.text(
+                bar_rect.right_center() - egui::vec2(8.0, 0.0),
+                egui::Align2::RIGHT_CENTER,
+                &name,
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(200, 200, 200),
+            );
+        }
+
+        // tiles — collect hover/clicks, then act (borrow-checker friendly)
+        let mut hot = false;
+        let mut clicked: Option<usize> = None;
+        let count = self.folder.len();
+        for i in 0..count {
+            let Some(tex) = self.thumbs.get(&self.folder[i]) else { continue };
+            let sz = tex.size_vec2();
+            let scale = (TILE / sz.y).min(3.0);
+            let w = (sz.x * scale).max(30.0);
+            let x = area.left() + 8.0 + i as f32 * (w + 2.0);
+            let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(w, TILE));
+            painter.image(tex.id(), r, egui::Rect::from_min_size(egui::Pos2::ZERO, sz), egui::Color32::WHITE);
+            if i == self.index {
+                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(47, 127, 196)), egui::StrokeKind::Inside);
+            }
+            let resp = ui.allocate_rect(r, egui::Sense::click());
+            if resp.hovered() {
+                hot = true;
+            }
+            if resp.clicked() {
+                clicked = Some(i);
+            }
+        }
+        self.strip_hover = hot;
+        if let Some(i) = clicked {
+            self.index = i;
+            self.show_current();
+        }
+
+        if let Some(e) = &self.error.clone() {
+            painter.text(area.center(), egui::Align2::CENTER_CENTER, e,
+                egui::FontId::proportional(14.0), egui::Color32::from_rgb(230, 120, 120));
+        }
+        if self.tex.is_none() && self.error.is_none() {
+            painter.text(area.center(), egui::Align2::CENTER_CENTER,
+                "No image — drop a photo here · Ctrl+O",
+                egui::FontId::proportional(14.0), egui::Color32::from_rgb(226, 229, 236));
+        }
+    }
+}
+
+/// Fit/fill/width/height/actual rect for a texture inside the view area.
+fn fit_rect(area: egui::Rect, size: egui::Vec2, z: &Zoom) -> egui::Rect {
+    if size.x <= 0.0 || size.y <= 0.0 || area.is_negative() {
+        return area;
+    }
+    let (sx, sy) = (area.width() / size.x, area.height() / size.y);
+    let k = match z.mode {
+        ZoomMode::Fill => sx.max(sy),
+        ZoomMode::Width => sx,
+        ZoomMode::Height => sy,
+        ZoomMode::Actual => 1.0,
+        ZoomMode::Fit => sx.min(sy),
+    } * z.scale;
+    let r = egui::Rect::from_center_size(area.center(), size * k);
+    egui::Rect::from_min_max(r.min + z.offset, r.max + z.offset)
+}
+
+fn vp(b: bool) -> bool {
+    b
+}
+
