@@ -574,13 +574,15 @@ fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
             }
             // photo: per-pixel demosaic — own channel from the centre, the
             // others averaged from same-colour neighbours in a 5×5 window
-            // (works for any CFA incl. X-Trans; ponytail: O(n×25) once)
+            // (works for any CFA incl. X-Trans)
             out = vec![0u8; cw * ch * 3];
-            for y in 0..ch {
+            // ponytail: 650M window samples at 26MP — one thread needed
+            // 5-7s and the RAW load felt hung; rows parallelize for free
+            use rayon::prelude::*;
+            out.par_chunks_mut(cw * 3).enumerate().for_each(|(y, row)| {
                 for x in 0..cw {
                     let (ax, ay) = (x + l, y + t);
                     let own = col_of(ay, ax).min(3);
-                    let i = (y * cw + x) * 3;
                     for c in 0..3 {
                         let mut sum = 0.0f32;
                         let mut n = 0u32;
@@ -606,10 +608,10 @@ fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
                         } else {
                             norm(data, ax, ay, own)
                         };
-                        out[i + c] = gamma(v * wb_of(c));
+                        row[x * 3 + c] = gamma(v * wb_of(c));
                     }
                 }
-            }
+            });
             Ok(DynamicImage::ImageRgb8(
                 image::RgbImage::from_raw(cw as u32, ch as u32, out).ok_or("raw buffer")?,
             ))
@@ -1324,8 +1326,13 @@ impl App {
                 egui::FontId::proportional(14.0), egui::Color32::from_rgb(230, 120, 120));
         }
         if self.tex.is_none() && self.error.is_none() {
-            painter.text(area.center(), egui::Align2::CENTER_CENTER,
-                "No image — drop a photo here · Ctrl+O",
+            // RAW takes seconds — say so instead of looking hung
+            let msg = match self.current() {
+                Some(p) if is_raw(p) => "Decoding RAW…",
+                Some(_) => "Loading…",
+                None => "No image — drop a photo here · Ctrl+O",
+            };
+            painter.text(area.center(), egui::Align2::CENTER_CENTER, msg,
                 egui::FontId::proportional(14.0), egui::Color32::from_rgb(226, 229, 236));
         }
     }
