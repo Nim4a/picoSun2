@@ -4,6 +4,7 @@
 use eframe::egui;
 use image::DynamicImage;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -88,6 +89,7 @@ pub struct App {
     fade: Option<Instant>,
     zoom: Zoom,
     error: Option<String>,
+    pick_mode: bool, // Color Picker armed (K)
     // wheel paging: bank notches during a burst; settle lands the last one
     banked: i32,
     last_notch: Instant,
@@ -109,6 +111,7 @@ impl App {
             fade: None,
             zoom: Zoom::default(),
             error: None,
+            pick_mode: false,
             banked: 0,
             last_notch: Instant::now(),
             strip_hover: false,
@@ -265,7 +268,33 @@ fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
 
 fn upload(ctx: &egui::Context, path: &Path, img: DynamicImage) -> egui::TextureHandle {
     let name = path.display().to_string();
+    // keep the decoded master for pixel tools (Color Picker)
+    if let Ok(mut c) = pixel_cache().lock() {
+        c.insert(path.to_path_buf(), std::sync::Arc::new(img.clone()));
+    }
     ctx.load_texture(name, to_color_image(&img), Default::default())
+}
+
+/// masters cache: decoded DynamicImage per path (session: master_for).
+/// Lets Color Picker read real pixels; Arc-shared with the decode worker.
+fn pixel_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<DynamicImage>>> {
+    static CELL: std::sync::OnceLock<Mutex<HashMap<PathBuf, Arc<DynamicImage>>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+impl App {
+    /// Read one pixel of the current master (u,v in 0..1 view space).
+    fn pixel_at(&self, _id: egui::TextureId, u: f32, v: f32) -> Option<[u8; 3]> {
+        let path = self.decoding.clone()?;
+        let cache = pixel_cache().lock().ok()?;
+        let img = cache.get(&path)?;
+        let rgba = img.to_rgba8();
+        let x = ((rgba.width() as f32 * u) as u32).min(rgba.width() - 1);
+        let y = ((rgba.height() as f32 * v).min(rgba.height() as f32 - 1.0)) as u32;
+        let p = rgba.get_pixel(x as u32, y as u32);
+        Some([p[0], p[1], p[2]])
+    }
 }
 
 impl eframe::App for App {
@@ -328,6 +357,34 @@ impl eframe::App for App {
         // drag pan when zoomed
         if ctx.input(|i| i.pointer.primary_down()) {
             self.zoom.offset += drag_delta;
+        }
+
+        // Color Picker: K arms it, next click copies the pixel color
+        if ctx.input(|i| i.key_pressed(egui::Key::K)) {
+            self.pick_mode = !self.pick_mode;
+        }
+        if self.pick_mode {
+            if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                if ctx.input(|i| i.pointer.primary_clicked()) {
+                    if let Some(tex) = &self.tex {
+                        let area = ui_rect(ctx);
+                        let rect = fit_rect(area, tex.size_vec2(), &self.zoom);
+                        if rect.contains(pos) {
+                            // map window point → texture pixel
+                            let u = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            let v = ((pos.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                            if let Some(px) = self.pixel_at(tex.id(), u, v) {
+                                let hex = format!("#{:02X}{:02X}{:02X}", px[0], px[1], px[2]);
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    let _ = cb.set_text(&hex);
+                                }
+                                self.error = Some(format!("copied {}", hex)); // reuse the status line
+                                self.pick_mode = false;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // double-click: fullscreen off (session rule); single click on photo = nothing
