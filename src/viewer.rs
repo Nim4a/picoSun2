@@ -303,6 +303,48 @@ fn pixel_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<DynamicImage>
 }
 
 impl App {
+    /// Save the current (rot/flip-applied) master to disk, format by extension.
+    fn save_current(&mut self) {
+        let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
+        let Some(img) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else {
+            self.error = Some("nothing loaded".into());
+            return;
+        };
+        let mut img = (*img).clone();
+        match self.rot {
+            1 => img = img.rotate90(),
+            2 => img = img.rotate180(),
+            3 => img = img.rotate270(),
+            _ => {}
+        }
+        if self.flipped {
+            img = img.fliph();
+        }
+        match img.save(&path) {
+            Ok(_) => self.error = Some("saved".into()),
+            Err(e) => self.error = Some(format!("save failed: {e}")),
+        }
+    }
+
+    /// Resize the master in place (factor <1 shrinks), save, refresh cache.
+    fn resize_master(&mut self, factor: f32) {
+        let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
+        let Some(img) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else { return };
+        let w = (img.width() as f32 * factor) as u32;
+        let h = (img.height() as f32 * factor) as u32;
+        let img = Arc::new(img.resize(w, h, image::imageops::FilterType::Lanczos3));
+        if let Ok(mut c) = pixel_cache().lock() {
+            c.insert(path.clone(), img.clone());
+        }
+        match img.save(&path) {
+            Ok(_) => {
+                self.retexture();
+                self.error = Some(format!("resized to {}×{}", w, h));
+            }
+            Err(e) => self.error = Some(format!("resize failed: {e}")),
+        }
+    }
+
     /// Step one frame of a multi-frame image; re-decodes from the master.
     fn next_frame(&mut self, dir: i64) {
         let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
@@ -451,6 +493,16 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::Comma)) {
             self.frame = self.frame.saturating_sub(1);
             self.retexture();
+        }
+
+        // Ctrl+S: save the current view (rot/flip applied) back to disk
+        if ctx.input(|i| (i.key_pressed(egui::Key::S) && i.modifiers.ctrl)) {
+            self.save_current();
+        }
+        // Ctrl+R: resize dialog is a clipboard-free inline prompt: Ctrl+Shift+R
+        // resizes the master to 50% and saves (session: resize-on-save, lazy)
+        if ctx.input(|i| (i.key_pressed(egui::Key::R) && i.modifiers.ctrl && i.modifiers.shift)) {
+            self.resize_master(0.5);
         }
 
         // Color Picker: K arms it, next click copies the pixel color
