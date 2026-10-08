@@ -115,15 +115,26 @@ pub struct App {
     drag_accum: f32,    // pixels dragged this press: click toggles only if tiny
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     decoding: Option<PathBuf>,
-    tile_rx: Receiver<(PathBuf, Result<DynamicImage, String>)>,
-    tile_tx: Sender<(PathBuf, Result<DynamicImage, String>)>,
-    master_rx: Receiver<(PathBuf, Result<DynamicImage, String>)>,
-    master_tx: Sender<(PathBuf, Result<DynamicImage, String>)>,
+    tile_rx: Receiver<(PathBuf, Result<Arc<DynamicImage>, String>)>,
+    tile_tx: Sender<(PathBuf, Result<Arc<DynamicImage>, String>)>,
+    master_rx: Receiver<(PathBuf, Result<Arc<DynamicImage>, String>)>,
+    master_tx: Sender<(PathBuf, Result<Arc<DynamicImage>, String>)>,
+    master_tex: Vec<(PathBuf, egui::TextureHandle)>, // uploaded masters, LRU-8
+    info_size: u64, // file size for the info bar: stat once, not per frame
     last_ctx: Option<egui::Context>, // stashed each update for retexture()
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, start: Option<String>) -> Self {
+        // thumb decodes can saturate rayon's global pool — leave one core
+        // for the UI thread (build_global fails harmlessly if already built)
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(
+                std::thread::available_parallelism()
+                    .map(|n| n.get().saturating_sub(1).max(1))
+                    .unwrap_or(3),
+            )
+            .build_global();
         let (tile_tx, tile_rx) = channel();
         let (master_tx, master_rx) = channel();
         let mut app = Self {
@@ -150,6 +161,8 @@ impl App {
             tile_tx,
             master_rx,
             master_tx,
+            master_tex: vec![],
+            info_size: 0,
             last_ctx: None,
         };
         if let Some(p) = start {
@@ -206,6 +219,7 @@ impl App {
     fn show_current(&mut self) {
         let Some(p) = self.current().map(|p| p.to_path_buf()) else { return };
         self.error = None;
+        self.info_size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         if !self.zoom.locked {
             // landing = fit view, fresh pan (Lock Zoom keeps the user's scale)
             self.zoom.mode = ZoomMode::Fit;
@@ -215,12 +229,30 @@ impl App {
         if !self.thumbs.contains_key(&p) {
             self.queue_thumb(p.clone());
         }
+        if let Some(h) = self.cached_master(&p) {
+            // uploaded already this session: land instantly, no decode wait
+            self.decoding = None;
+            self.prev_tex = self.tex.take();
+            self.tex = Some(h);
+            self.fade = Some(Instant::now());
+            return;
+        }
         self.decoding = Some(p.clone());
-        let tx = self.master_tx.clone();
-        rayon::spawn(move || {
-            let img = read_image(&p);
-            let _ = tx.send((p, img));
-        });
+        spawn_master(p, self.master_tx.clone());
+    }
+
+    /// Uploaded master textures: paging back shows the photo at once
+    /// (no re-decode, no re-upload — the per-landing stutter).
+    fn cached_master(&self, p: &Path) -> Option<egui::TextureHandle> {
+        self.master_tex.iter().find(|(q, _)| q == p).map(|(_, h)| h.clone())
+    }
+
+    fn put_master(&mut self, p: PathBuf, h: egui::TextureHandle) {
+        self.master_tex.retain(|(q, _)| q != &p);
+        if self.master_tex.len() >= 8 {
+            self.master_tex.remove(0); // LRU-8: bounded VRAM (~8 masters)
+        }
+        self.master_tex.push((p, h));
     }
 
     /// Decode one small tile on the worker pool (never blocks the UI).
@@ -230,8 +262,8 @@ impl App {
         }
         let tx = self.tile_tx.clone();
         rayon::spawn(move || {
-            let img =
-                read_image(&path).map(|im| im.thumbnail((TILE * 3.0) as u32, (TILE * 3.0) as u32));
+            let img = read_image(&path)
+                .map(|im| Arc::new(im.thumbnail((TILE * 3.0) as u32, (TILE * 3.0) as u32)));
             let _ = tx.send((path, img.map_err(|e| e.to_string())));
         });
     }
@@ -276,6 +308,7 @@ impl App {
             self.zoom.offset = egui::Vec2::ZERO;
         }
         let p = self.folder[self.index].clone();
+        self.info_size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         if !self.thumbs.contains_key(&p) {
             self.queue_thumb(p.clone());
         } else if let Some(tile) = self.thumbs.get(&p).cloned() {
@@ -292,12 +325,16 @@ impl App {
         if self.decoding.as_deref() == Some(p.as_path()) {
             return; // already in flight
         }
+        if let Some(h) = self.cached_master(&p) {
+            // seen this session: sharpen instantly (tile → master crossfade)
+            self.decoding = None;
+            self.prev_tex = self.tex.take();
+            self.tex = Some(h);
+            self.fade = Some(Instant::now());
+            return;
+        }
         self.decoding = Some(p.clone());
-        let tx = self.master_tx.clone();
-        rayon::spawn(move || {
-            let img = read_image(&p);
-            let _ = tx.send((p, img));
-        });
+        spawn_master(p, self.master_tx.clone());
     }
 
     /// Take tiles and masters off their worker channels; upload as textures.
@@ -305,7 +342,7 @@ impl App {
         while let Ok((path, res)) = self.tile_rx.try_recv() {
             match res {
                 Ok(img) => {
-                    let tex = upload(ctx, &path, img);
+                    let tex = upload(ctx, &path, &img);
                     // tile for the photo we're now on = instant feedback while
                     // its master still decodes (cold cache showed nothing)
                     let is_current = self.current() == Some(path.as_path());
@@ -325,7 +362,8 @@ impl App {
             }
             match res {
                 Ok(img) => {
-                    let tex = upload(ctx, &path, img);
+                    let tex = upload_master(ctx, &path, img);
+                    self.put_master(path.clone(), tex.clone());
                     // crossfade: old photo stays on top and fades OUT
                     self.prev_tex = self.tex.take();
                     self.tex = Some(tex);
@@ -339,6 +377,26 @@ impl App {
             }
         }
     }
+}
+
+/// Masters decode on their OWN single thread: a thumb storm on the global
+/// pool must never delay the landing sharpen (session: instant-first).
+fn spawn_master(
+    path: PathBuf,
+    tx: Sender<(PathBuf, Result<Arc<DynamicImage>, String>)>,
+) {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .thread_name(|i| format!("p2-master-{i}"))
+            .build()
+            .expect("master pool")
+    });
+    pool.spawn(move || {
+        let img = read_image(&path).map(Arc::new);
+        let _ = tx.send((path, img));
+    });
 }
 
 fn read_image(path: &Path) -> Result<DynamicImage, String> {
@@ -366,13 +424,21 @@ fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
     )
 }
 
-fn upload(ctx: &egui::Context, path: &Path, img: DynamicImage) -> egui::TextureHandle {
-    let name = path.display().to_string();
-    // keep the decoded master for pixel tools (Color Picker)
+fn upload(ctx: &egui::Context, path: &Path, img: &DynamicImage) -> egui::TextureHandle {
+    ctx.load_texture(path.display().to_string(), to_color_image(img), Default::default())
+}
+
+/// Master upload: CPU pixels Arc-shared into the cache (no copy), texture
+/// on screen, and the handle also kept by the caller for master_tex.
+fn upload_master(
+    ctx: &egui::Context,
+    path: &Path,
+    img: Arc<DynamicImage>,
+) -> egui::TextureHandle {
     if let Ok(mut c) = pixel_cache().lock() {
-        c.insert(path.to_path_buf(), std::sync::Arc::new(img.clone()));
+        c.insert(path.to_path_buf(), img.clone()); // Arc clone = pointer copy
     }
-    ctx.load_texture(name, to_color_image(&img), Default::default())
+    upload(ctx, path, &img)
 }
 
 /// masters cache: decoded DynamicImage per path (session: master_for).
@@ -417,6 +483,7 @@ impl App {
         if let Ok(mut c) = pixel_cache().lock() {
             c.insert(path.clone(), img.clone());
         }
+        self.master_tex.retain(|(q, _)| q != &path); // texture cache: stale now
         match img.save(&path) {
             Ok(_) => {
                 self.retexture();
@@ -455,7 +522,7 @@ impl App {
             img = img.fliph();
         }
         if let Some(ctx) = self.ctx() {
-            self.tex = Some(upload(&ctx, &path, img));
+            self.tex = Some(upload(&ctx, &path, &img));
             self.fade = None;
             self.prev_tex = None;
         }
@@ -881,7 +948,7 @@ impl App {
                 let s = t.size_vec2();
                 format!("{}×{}", s.x as u32, s.y as u32)
             }).unwrap_or_default();
-            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let size = self.info_size; // stat once per photo, not per frame
             let kb = if size > 1_048_576 {
                 format!("{:.1} MB", size as f64 / 1_048_576.0)
             } else {
@@ -916,6 +983,7 @@ impl App {
         let count = if self.strip_on { self.folder.len() } else { 0 };
         // tiles advance by their true width (aspect-preserved), like Picasa
         let mut x = area.left() + 8.0;
+        let mut start = 0usize;
         // keep the current tile in view: shift the row when it lands off-screen
         if count > 0 {
             let wid = |t: &egui::TextureHandle| {
@@ -930,10 +998,22 @@ impl App {
             }
             let cur = self.thumbs.get(&self.folder[self.index]).map(wid).unwrap_or(60.0);
             if pos + cur > area.right() - 8.0 {
-                x -= pos + cur - (area.right() - 8.0);
+                let over = pos + cur - (area.right() - 8.0);
+                x -= over;
+                // draw only tiles that stay on screen after the shift:
+                // walk back until the previous tile is fully left of the view
+                let limit = area.right() - 8.0 - cur; // == pos - over
+                let mut i = self.index;
+                let mut acc = 0.0;
+                while i > 0 && acc < limit {
+                    let Some(t) = self.thumbs.get(&self.folder[i - 1]) else { break };
+                    acc += wid(t) + 2.0;
+                    i -= 1;
+                }
+                start = i;
             }
         }
-        for i in 0..count {
+        for i in start..count {
             let Some(tex) = self.thumbs.get(&self.folder[i]) else { continue };
             let sz = tex.size_vec2();
             let w = (sz.x * (TILE / sz.y)).clamp(20.0, TILE * 2.0);
