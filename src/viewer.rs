@@ -473,6 +473,31 @@ impl App {
         );
         painter.rect_filled(strip_rect, 0.0, egui::Color32::from_rgb(8, 9, 12));
 
+        // floating ⤢ top-right: only in fullscreen; leaves fullscreen, never quits
+        let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if fs {
+            let btn = egui::Rect::from_min_size(
+                egui::pos2(area.right() - 48.0, 8.0),
+                egui::vec2(40.0, 30.0),
+            );
+            let resp = ui.allocate_rect(btn, egui::Sense::click());
+            painter.rect_filled(btn, 8.0, if resp.hovered() {
+                egui::Color32::from_rgb(196, 43, 28)
+            } else {
+                egui::Color32::from_rgba_premultiplied(16, 20, 30, 120)
+            });
+            painter.text(
+                btn.center(),
+                egui::Align2::CENTER_CENTER,
+                "⤢",
+                egui::FontId::proportional(15.0),
+                egui::Color32::WHITE,
+            );
+            if resp.clicked() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
+        }
+
         // info bar above (name + counter), thin grey
         let bar_rect = egui::Rect::from_min_size(
             egui::pos2(area.left(), strip_rect.top() - BAR),
