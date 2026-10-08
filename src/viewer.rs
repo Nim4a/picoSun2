@@ -95,6 +95,7 @@ pub struct App {
     frame: usize,    // multi-frame index (GIF etc.)
     // wheel paging: bank notches during a burst; settle lands the last one
     banked: i32,
+    wheel_points: f32, // strip scroll: accumulate egui's smoothed points, step per notch
     last_notch: Instant,
     strip_hover: bool,
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
@@ -123,6 +124,7 @@ impl App {
             flipped: false,
             frame: 0,
             banked: 0,
+            wheel_points: 0.0,
             last_notch: Instant::now(),
             strip_hover: false,
             thumbs: HashMap::new(),
@@ -282,6 +284,13 @@ impl App {
             match res {
                 Ok(img) => {
                     let tex = upload(ctx, &path, img);
+                    // tile for the photo we're now on = instant feedback while
+                    // its master still decodes (cold cache showed nothing)
+                    let is_current = self.current() == Some(path.as_path());
+                    if is_current && self.decoding.is_some() && self.fade.is_none() {
+                        self.prev_tex = None;
+                        self.tex = Some(tex.clone());
+                    }
                     self.thumbs.insert(path, tex);
                 }
                 Err(_) => {} // a bad tile just stays blank in the strip
@@ -495,7 +504,18 @@ impl eframe::App for App {
             ctx.input(|i| (i.smooth_scroll_delta.y, i.pointer.latest_pos(), self.strip_hover, i.pointer.delta()));
         if wheel_y != 0.0 {
             if strip_hot {
-                self.wheel(if wheel_y < 0.0 { 1 } else { -1 });
+                // egui smooths one wheel notch (~40pt) across ~10 frames, so
+                // stepping per frame jumped ~10 photos. Accumulate, step/notch.
+                self.wheel_points += wheel_y;
+                let notch = 40.0f32; // egui Options::line_scroll_speed (native)
+                while self.wheel_points <= -notch {
+                    self.wheel_points += notch;
+                    self.wheel(1);
+                }
+                while self.wheel_points >= notch {
+                    self.wheel_points -= notch;
+                    self.wheel(-1);
+                }
             } else {
                 // keep the pixel under the pointer still while zooming:
                 // new_rect = pointer - (pointer - old_rect.min) * factor
