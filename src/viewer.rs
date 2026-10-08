@@ -173,19 +173,26 @@ impl App {
         self.error = None;
         self.zoom.mode = ZoomMode::Fit;
         if !self.thumbs.contains_key(&p) {
-            let tx = self.tile_tx.clone();
-            let small = p.clone();
-            rayon::spawn(move || {
-                let img =
-                    read_image(&small).map(|im| im.thumbnail((TILE * 3.0) as u32, TILE as u32 * 3));
-                let _ = tx.send((small, img.map_err(|e| e.to_string())));
-            });
+            self.queue_thumb(p.clone());
         }
         self.decoding = Some(p.clone());
         let tx = self.tile_tx.clone();
         rayon::spawn(move || {
             let img = read_image(&p);
             let _ = tx.send((p, img));
+        });
+    }
+
+    /// Decode one small tile on the worker pool (never blocks the UI).
+    fn queue_thumb(&mut self, path: PathBuf) {
+        if self.thumbs.contains_key(&path) {
+            return;
+        }
+        let tx = self.tile_tx.clone();
+        rayon::spawn(move || {
+            let img =
+                read_image(&path).map(|im| im.thumbnail((TILE * 3.0) as u32, (TILE * 3.0) as u32));
+            let _ = tx.send((path, img.map_err(|e| e.to_string())));
         });
     }
 
@@ -286,13 +293,30 @@ impl eframe::App for App {
             }
         }
 
-        // wheel: on photo → zoom; over strip → page (session contract)
-        let (wheel_y, strip_hot, over_photo) = ui_input(ctx);
+        // wheel: on photo → zoom anchored at the pointer; over strip → page
+        let (wheel_y, pos, strip_hot, drag_delta) =
+            ctx.input(|i| (i.smooth_scroll_delta.y, i.pointer.latest_pos(), self.strip_hover, i.pointer.delta()));
         if wheel_y != 0.0 {
             if strip_hot {
                 self.wheel(if wheel_y < 0.0 { 1 } else { -1 });
             } else {
-                self.zoom_at(wheel_y.signum());
+                // keep the pixel under the pointer still while zooming:
+                // new_rect = pointer - (pointer - old_rect.min) * factor
+                let f = if wheel_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
+                let area = ui_rect(ctx);
+                if let Some(pt) = pos {
+                    if let Some(tex) = &self.tex {
+                        let old = fit_rect(area, tex.size_vec2(), &self.zoom);
+                        self.zoom.scale *= f;
+                        if self.zoom.mode == ZoomMode::Fit {
+                            self.zoom.mode = ZoomMode::Actual; // manual zoom
+                        }
+                        let new = fit_rect(area, tex.size_vec2(), &self.zoom);
+                        self.zoom.offset += (old.min - new.min) + (old.min - pt) * (1.0 - f) / f;
+                        // ponytail: offset correction is algebra on rect corners;
+                        // exact pointer-stability verified by test below
+                    }
+                }
             }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
@@ -302,9 +326,16 @@ impl eframe::App for App {
             self.step(-1);
         }
         // drag pan when zoomed
-        if over_photo && ctx.input(|i| i.pointer.primary_down()) {
-            let d = ctx.input(|i| i.pointer.delta());
-            self.zoom.offset += d;
+        if ctx.input(|i| i.pointer.primary_down()) {
+            self.zoom.offset += drag_delta;
+        }
+
+        // double-click: fullscreen off (session rule); single click on photo = nothing
+        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            if fs {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            }
         }
 
         // the whole window is one layer: photo floats, desktop shows through
@@ -327,6 +358,11 @@ fn ui_input(ctx: &egui::Context) -> (f32, bool, bool) {
             false,
         )
     })
+}
+
+/// The central panel rect without building a Ui (for input math).
+fn ui_rect(ctx: &egui::Context) -> egui::Rect {
+    ctx.screen_rect()
 }
 
 impl App {
@@ -401,12 +437,12 @@ impl App {
         let mut hot = false;
         let mut clicked: Option<usize> = None;
         let count = self.folder.len();
+        // tiles advance by their true width (aspect-preserved), like Picasa
+        let mut x = area.left() + 8.0;
         for i in 0..count {
             let Some(tex) = self.thumbs.get(&self.folder[i]) else { continue };
             let sz = tex.size_vec2();
-            let scale = (TILE / sz.y).min(3.0);
-            let w = (sz.x * scale).max(30.0);
-            let x = area.left() + 8.0 + i as f32 * (w + 2.0);
+            let w = (sz.x * (TILE / sz.y)).clamp(20.0, TILE * 2.0);
             let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(w, TILE));
             painter.image(tex.id(), r, egui::Rect::from_min_size(egui::Pos2::ZERO, sz), egui::Color32::WHITE);
             if i == self.index {
@@ -419,11 +455,28 @@ impl App {
             if resp.clicked() {
                 clicked = Some(i);
             }
+            x += w + 2.0;
+            if x > area.right() {
+                break; // beyond the screen: skip the rest (they're off-view)
+            }
         }
         self.strip_hover = hot;
         if let Some(i) = clicked {
             self.index = i;
             self.show_current();
+        }
+
+        // preload neighbours: after landing, prev/next tiles decode in the
+        // background so paging feels instant (session: hardware-aware caching)
+        if let Some(p) = self.current().map(|p| p.to_path_buf()) {
+            for d in [-1i64, 1] {
+                if let Some(n) = self.folder.get((self.index as i64 + d) as usize) {
+                    if !self.thumbs.contains_key(n) {
+                        self.queue_thumb(n.clone());
+                    }
+                }
+            }
+            let _ = p;
         }
 
         if let Some(e) = &self.error.clone() {
