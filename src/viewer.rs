@@ -266,7 +266,7 @@ impl App {
     fn put_master(&mut self, p: PathBuf, h: egui::TextureHandle) {
         self.master_tex.retain(|(q, _)| q != &p);
         if self.master_tex.len() >= 8 {
-            self.master_tex.remove(0); // LRU-8: bounded VRAM (~8 masters)
+            let _ = self.master_tex.remove(0); // LRU-8: dropping the handle evicts the texture
         }
         self.master_tex.push((p, h));
     }
@@ -694,7 +694,7 @@ impl App {
     /// Step one frame of a multi-frame image; re-decodes from the master.
     fn next_frame(&mut self, dir: i64) {
         let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
-        let Some(master) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else { return };
+        let Some(_master) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else { return };
         // ponytail: `image` crate decodes only the first GIF frame; real
         // multi-frame needs the `gif` decoder — counts frames via seek loop
         let frames = count_frames(&path);
@@ -937,12 +937,12 @@ impl eframe::App for App {
         }
 
         // Ctrl+S: save the current view (rot/flip applied) back to disk
-        if ctx.input(|i| (i.key_pressed(egui::Key::S) && i.modifiers.ctrl)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::S) && i.modifiers.ctrl) {
             self.save_current();
         }
         // Ctrl+R: resize dialog is a clipboard-free inline prompt: Ctrl+Shift+R
         // resizes the master to 50% and saves (session: resize-on-save, lazy)
-        if ctx.input(|i| (i.key_pressed(egui::Key::R) && i.modifiers.ctrl && i.modifiers.shift)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::R) && i.modifiers.ctrl && i.modifiers.shift) {
             self.resize_master(0.5);
         }
 
@@ -1083,16 +1083,6 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
     }
-}
-
-fn ui_input(ctx: &egui::Context) -> (f32, bool, bool) {
-    ctx.input(|i| {
-        (
-            i.smooth_scroll_delta.y,
-            false, // strip hover resolved inside paint; wheel paging uses explicit hover
-            false,
-        )
-    })
 }
 
 /// The central panel rect without building a Ui (for input math).
@@ -1296,7 +1286,7 @@ impl App {
             let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(w, TILE));
             painter.image(tex.id(), r, uv(), egui::Color32::WHITE);
             if i == self.index {
-                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(47, 127, 196)), egui::StrokeKind::Inside);
+                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5f32, egui::Color32::from_rgb(47, 127, 196)), egui::StrokeKind::Inside);
             }
             let resp = ui.allocate_rect(r, egui::Sense::click());
             if resp.hovered() {
@@ -1410,10 +1400,6 @@ fn zoom_step(z: &mut Zoom, area: egui::Rect, size: egui::Vec2, f: f32, pt: egui:
         pt.y - (pt.y - old.min.y) * ry - new.min.y,
     );
     clamp_view(z, area, size);
-}
-
-fn vp(b: bool) -> bool {
-    b
 }
 
 #[cfg(test)]
