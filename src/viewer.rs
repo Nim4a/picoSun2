@@ -101,12 +101,15 @@ pub struct App {
     decoding: Option<PathBuf>,
     tile_rx: Receiver<(PathBuf, Result<DynamicImage, String>)>,
     tile_tx: Sender<(PathBuf, Result<DynamicImage, String>)>,
+    master_rx: Receiver<(PathBuf, Result<DynamicImage, String>)>,
+    master_tx: Sender<(PathBuf, Result<DynamicImage, String>)>,
     last_ctx: Option<egui::Context>, // stashed each update for retexture()
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, start: Option<String>) -> Self {
         let (tile_tx, tile_rx) = channel();
+        let (master_tx, master_rx) = channel();
         let mut app = Self {
             folder: vec![],
             index: 0,
@@ -126,6 +129,8 @@ impl App {
             decoding: None,
             tile_rx,
             tile_tx,
+            master_rx,
+            master_tx,
             last_ctx: None,
         };
         if let Some(p) = start {
@@ -189,7 +194,7 @@ impl App {
             self.queue_thumb(p.clone());
         }
         self.decoding = Some(p.clone());
-        let tx = self.tile_tx.clone();
+        let tx = self.master_tx.clone();
         rayon::spawn(move || {
             let img = read_image(&p);
             let _ = tx.send((p, img));
@@ -234,21 +239,29 @@ impl App {
         self.last_notch = Instant::now();
     }
 
-    /// Take tiles off the worker channel; upload as textures.
+    /// Take tiles and masters off their worker channels; upload as textures.
     fn poll_decode(&mut self, ctx: &egui::Context) {
         while let Ok((path, res)) = self.tile_rx.try_recv() {
             match res {
                 Ok(img) => {
-                    let is_master = self.decoding.as_deref() == Some(path.as_path());
                     let tex = upload(ctx, &path, img);
-                    if is_master {
-                        // crossfade: old photo stays on top and fades OUT
-                        self.prev_tex = self.tex.take();
-                        self.tex = Some(tex);
-                        self.fade = Some(Instant::now());
-                    } else {
-                        self.thumbs.insert(path, tex);
-                    }
+                    self.thumbs.insert(path, tex);
+                }
+                Err(_) => {} // a bad tile just stays blank in the strip
+            }
+        }
+        while let Ok((path, res)) = self.master_rx.try_recv() {
+            // stale master (user paged past it already) must not clobber
+            if self.decoding.as_deref() != Some(path.as_path()) {
+                continue;
+            }
+            match res {
+                Ok(img) => {
+                    let tex = upload(ctx, &path, img);
+                    // crossfade: old photo stays on top and fades OUT
+                    self.prev_tex = self.tex.take();
+                    self.tex = Some(tex);
+                    self.fade = Some(Instant::now());
                     self.decoding = None;
                 }
                 Err(e) => {
