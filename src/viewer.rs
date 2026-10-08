@@ -481,12 +481,30 @@ impl App {
         painter.rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(24, 25, 28));
         if let Some(p) = self.current() {
             let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            // info: counter (left) · dims + size (center) · name (right)
+            let dims = self.tex.as_ref().map(|t| {
+                let s = t.size_vec2();
+                format!("{}×{}", s.x as u32, s.y as u32)
+            }).unwrap_or_default();
+            let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+            let kb = if size > 1_048_576 {
+                format!("{:.1} MB", size as f64 / 1_048_576.0)
+            } else {
+                format!("{} KB", size / 1024)
+            };
             painter.text(
                 bar_rect.left_top() + egui::vec2(8.0, BAR / 2.0),
                 egui::Align2::LEFT_CENTER,
                 format!("{} / {}", self.index + 1, self.folder.len()),
                 egui::FontId::proportional(11.0),
                 egui::Color32::from_rgb(200, 200, 205),
+            );
+            painter.text(
+                bar_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("{}  ·  {}", dims, kb),
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(150, 152, 158),
             );
             painter.text(
                 bar_rect.right_center() - egui::vec2(8.0, 0.0),
