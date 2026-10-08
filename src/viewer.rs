@@ -417,11 +417,10 @@ impl eframe::App for App {
         self.last_ctx = Some(ctx.clone()); // retexture() needs it between frames
         self.poll_decode(ctx);
 
-        // settle: burst over → banked is moot (steps already happened); drop it
+        // settle: burst over → banked only tracks that a burst happened;
+        // steps already landed per notch in wheel(), so just clear it
         if self.banked != 0 && self.last_notch.elapsed() >= SETTLE {
-            let dir = self.banked.signum();
             self.banked = 0;
-            self.step(dir);
         }
 
         // input: fullscreen / pages / zoom / pan
