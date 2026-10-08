@@ -10,6 +10,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const SETTLE: Duration = Duration::from_millis(220);
+const NOTCH: f32 = 40.0; // egui Options::line_scroll_speed: one wheel notch in points
 const FADE: f32 = 0.18; // crossfade seconds
 const TILE: f32 = 49.0; // Picasa strip tile height
 const BAR: f32 = 17.0; // info bar above the strip
@@ -73,12 +74,24 @@ enum ZoomMode {
     Actual,
 }
 
-#[derive(Default)]
 struct Zoom {
     mode: ZoomMode,
     scale: f32,
     offset: egui::Vec2,
     locked: bool, // Lock Zoom (L): a landing keeps the user's scale
+}
+
+impl Default for Zoom {
+    fn default() -> Self {
+        // derive(Default) would give scale=0.0 (f32 default) → fit_rect
+        // multiplies by 0 → zero-size rect → photo invisible (the "black photos")
+        Self {
+            mode: ZoomMode::Fit,
+            scale: 1.0,
+            offset: egui::Vec2::ZERO,
+            locked: false,
+        }
+    }
 }
 
 pub struct App {
@@ -190,7 +203,10 @@ impl App {
         let Some(p) = self.current().map(|p| p.to_path_buf()) else { return };
         self.error = None;
         if !self.zoom.locked {
-            self.zoom.mode = ZoomMode::Fit; // landing fits unless Lock Zoom
+            // landing = fit view, fresh pan (Lock Zoom keeps the user's scale)
+            self.zoom.mode = ZoomMode::Fit;
+            self.zoom.scale = 1.0;
+            self.zoom.offset = egui::Vec2::ZERO;
         }
         if !self.thumbs.contains_key(&p) {
             self.queue_thumb(p.clone());
@@ -252,6 +268,8 @@ impl App {
         self.error = None;
         if !self.zoom.locked {
             self.zoom.mode = ZoomMode::Fit;
+            self.zoom.scale = 1.0;
+            self.zoom.offset = egui::Vec2::ZERO;
         }
         let p = self.folder[self.index].clone();
         if !self.thumbs.contains_key(&p) {
@@ -463,6 +481,14 @@ impl eframe::App for App {
         self.last_ctx = Some(ctx.clone()); // retexture() needs it between frames
         self.poll_decode(ctx);
 
+        // fade finished → drop the old photo (otherwise repaint runs forever)
+        if let Some(t) = self.fade {
+            if t.elapsed().as_secs_f32() >= FADE {
+                self.fade = None;
+                self.prev_tex = None;
+            }
+        }
+
         // settle: wheel quiet → decode the master for wherever we landed.
         // Steps already moved per-notch on cached tiles; exactly one master.
         if self.banked != 0 && self.last_notch.elapsed() >= SETTLE {
@@ -507,7 +533,7 @@ impl eframe::App for App {
                 // egui smooths one wheel notch (~40pt) across ~10 frames, so
                 // stepping per frame jumped ~10 photos. Accumulate, step/notch.
                 self.wheel_points += wheel_y;
-                let notch = 40.0f32; // egui Options::line_scroll_speed (native)
+                let notch = NOTCH;
                 while self.wheel_points <= -notch {
                     self.wheel_points += notch;
                     self.wheel(1);
@@ -517,21 +543,29 @@ impl eframe::App for App {
                     self.wheel(-1);
                 }
             } else {
-                // keep the pixel under the pointer still while zooming:
-                // new_rect = pointer - (pointer - old_rect.min) * factor
-                let f = if wheel_y > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                let area = ui_rect(ctx);
-                if let Some(pt) = pos {
-                    if let Some(tex) = &self.tex {
-                        let old = fit_rect(area, tex.size_vec2(), &self.zoom);
-                        self.zoom.scale *= f;
-                        if self.zoom.mode == ZoomMode::Fit {
-                            self.zoom.mode = ZoomMode::Actual; // manual zoom
+                // zoom: same smoothing rule as the strip — egui spreads one
+                // notch over ~10 frames; stepping per frame zoomed 0.21x/notch
+                // and threw the photo off-screen (scale=0.12, off=-2500).
+                self.wheel_points += wheel_y;
+                while self.wheel_points.abs() >= NOTCH {
+                    let up = self.wheel_points > 0.0;
+                    self.wheel_points = if up { self.wheel_points - NOTCH } else { self.wheel_points + NOTCH };
+                    // keep the pixel under the pointer still while zooming:
+                    // new_rect = pointer - (pointer - old_rect.min) * factor
+                    let f = if up { 1.15 } else { 1.0 / 1.15 };
+                    let area = ui_rect(ctx);
+                    if let Some(pt) = pos {
+                        if let Some(tex) = &self.tex {
+                            let old = fit_rect(area, tex.size_vec2(), &self.zoom);
+                            self.zoom.scale *= f;
+                            if self.zoom.mode == ZoomMode::Fit {
+                                self.zoom.mode = ZoomMode::Actual; // manual zoom
+                            }
+                            let new = fit_rect(area, tex.size_vec2(), &self.zoom);
+                            self.zoom.offset += (old.min - new.min) + (old.min - pt) * (1.0 - f) / f;
+                            // ponytail: offset correction is algebra on rect corners;
+                            // exact pointer-stability verified by test below
                         }
-                        let new = fit_rect(area, tex.size_vec2(), &self.zoom);
-                        self.zoom.offset += (old.min - new.min) + (old.min - pt) * (1.0 - f) / f;
-                        // ponytail: offset correction is algebra on rect corners;
-                        // exact pointer-stability verified by test below
                     }
                 }
             }
@@ -620,6 +654,16 @@ impl eframe::App for App {
         if self.fade.is_some() {
             ctx.request_repaint();
         }
+
+        // egui stops repainting when input stops, but the wheel settle and the
+        // worker-channel results need FUTURE frames — otherwise the master
+        // decode after a page never lands (tex stayed the 147px tile forever)
+        if self.banked != 0 {
+            ctx.request_repaint_after(SETTLE + Duration::from_millis(32));
+        }
+        if self.decoding.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
     }
 }
 
@@ -667,12 +711,12 @@ impl App {
                     painter.image(
                         prev.id(),
                         fit_rect(area, ps, &self.zoom),
-                        egui::Rect::from_min_size(egui::Pos2::ZERO, ps),
+                        uv(),
                         tint,
                     );
                 }
             }
-            painter.image(tex.id(), rect, egui::Rect::from_min_size(egui::Pos2::ZERO, size), egui::Color32::WHITE);
+            painter.image(tex.id(), rect, uv(), egui::Color32::WHITE);
         }
 
         // Picasa strip: navy band at the bottom, tiles 30px tall
@@ -760,7 +804,7 @@ impl App {
             let sz = tex.size_vec2();
             let w = (sz.x * (TILE / sz.y)).clamp(20.0, TILE * 2.0);
             let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(w, TILE));
-            painter.image(tex.id(), r, egui::Rect::from_min_size(egui::Pos2::ZERO, sz), egui::Color32::WHITE);
+            painter.image(tex.id(), r, uv(), egui::Color32::WHITE);
             if i == self.index {
                 painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(47, 127, 196)), egui::StrokeKind::Inside);
             }
@@ -807,6 +851,13 @@ impl App {
     }
 }
 
+/// Full-texture UV rect. egui expects NORMALIZED [0,1] UVs — pixel-sized
+/// ones (0..width) clamp to the edge, so the whole photo rendered as a single
+/// color (the bottom-right pixel) and tiles looked monochrome.
+fn uv() -> egui::Rect {
+    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+}
+
 /// Fit/fill/width/height/actual rect for a texture inside the view area.
 fn fit_rect(area: egui::Rect, size: egui::Vec2, z: &Zoom) -> egui::Rect {
     if size.x <= 0.0 || size.y <= 0.0 || area.is_negative() {
@@ -826,5 +877,37 @@ fn fit_rect(area: egui::Rect, size: egui::Vec2, z: &Zoom) -> egui::Rect {
 
 fn vp(b: bool) -> bool {
     b
+}
+
+#[cfg(test)]
+mod decode_tests {
+    use super::*;
+
+    #[test]
+    fn decode_pic1() {
+        let p = std::path::Path::new(r"Z:\hermes\picasa-photo-viewer\testpics\pic1.jpg");
+        let img = read_image(p).expect("decode failed");
+        println!("dims: {}x{}", img.width(), img.height());
+        let rgba = img.to_rgba8();
+        for (x, y, label) in [
+            (0usize, 0usize, "topleft"),
+            (800, 500, "center"),
+            (1599, 999, "botright"),
+            (800, 10, "toprow"),
+        ] {
+            let px = rgba.get_pixel(x as u32, y as u32);
+            println!("{label} ({x},{y}): {:?}", px.0);
+        }
+        let mut sum = [0u64; 3];
+        let mut n = 0u64;
+        for py in rgba.chunks_exact(4).step_by(137) {
+            sum[0] += py[0] as u64;
+            sum[1] += py[1] as u64;
+            sum[2] += py[2] as u64;
+            n += 1;
+        }
+        println!("mean: ({},{},{}) over {} samples", sum[0] / n, sum[1] / n, sum[2] / n, n);
+        // PIL reference: dims 1600x1000, topleft ~61, mean (58,53,72)
+    }
 }
 
