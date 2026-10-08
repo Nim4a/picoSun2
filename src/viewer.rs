@@ -33,10 +33,10 @@ fn is_image(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// RAW formats rawloader 0.37 actually decodes (no CR3/GoPro — those keep
-/// the plain "unsupported" error instead of lying about support).
+/// RAW formats rawler 0.8 actually decodes (GoPro GPR & friends stay
+/// plain "unsupported" errors instead of lying about support).
 const RAW_DECODE_EXTS: &[&str] = &[
-    "3fr", "ari", "arw", "cr2", "crw", "dcs", "dcr", "dng", "erf", "iiq", "kdc",
+    "3fr", "ari", "arw", "cr2", "cr3", "crw", "dcs", "dcr", "dng", "erf", "iiq", "kdc",
     "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "rw2", "srw", "x3f",
 ];
 
