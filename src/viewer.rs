@@ -111,6 +111,8 @@ pub struct App {
     wheel_points: f32, // strip scroll: accumulate egui's smoothed points, step per notch
     last_notch: Instant,
     strip_hover: bool,
+    strip_on: bool,     // Ctrl+T shows/hides the strip (old viewer parity)
+    drag_accum: f32,    // pixels dragged this press: click toggles only if tiny
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     decoding: Option<PathBuf>,
     tile_rx: Receiver<(PathBuf, Result<DynamicImage, String>)>,
@@ -140,6 +142,8 @@ impl App {
             wheel_points: 0.0,
             last_notch: Instant::now(),
             strip_hover: false,
+            strip_on: true,
+            drag_accum: 0.0,
             thumbs: HashMap::new(),
             decoding: None,
             tile_rx,
@@ -497,14 +501,17 @@ impl eframe::App for App {
         }
 
         // input: fullscreen / pages / zoom / pan
-        if ctx.input(|i| i.key_pressed(egui::Key::F) || i.key_pressed(egui::Key::F11)) {
+        if ctx.input(|i| (i.key_pressed(egui::Key::F) && !i.modifiers.shift) || i.key_pressed(egui::Key::F11)) {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
         }
+        // Esc: leave fullscreen, or close when already fitted (old parity)
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             if fs {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            } else if !self.is_fitted() {
+                self.set_mode(ZoomMode::Fit);
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -514,22 +521,86 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::L)) {
             self.zoom.locked = !self.zoom.locked;
         }
-        // rotate (R) / flip (H): re-render the master transformed, same path
-        // as the old viewer's non-destructive edits
-        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+        // rotate (R): re-render the master transformed, same path as the old
+        // viewer's non-destructive edits. Flip moved to Ctrl+H (H = height).
+        if ctx.input(|i| i.key_pressed(egui::Key::R) && !i.modifiers.ctrl) {
             self.rot = (self.rot + 1) % 4;
             self.retexture();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::H)) {
+        if ctx.input(|i| i.key_pressed(egui::Key::H) && i.modifiers.ctrl) {
             self.flipped = !self.flipped;
             self.retexture();
         }
+        // one-shot view modes (old nav parity): 0 fit / 1 actual / W width /
+        // H height / Shift+F fill / + − anchored zoom
+        if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
+            self.set_mode(ZoomMode::Fit);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
+            self.set_mode(ZoomMode::Actual);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::W) && !i.modifiers.ctrl) {
+            self.set_mode(ZoomMode::Width);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::H) && !i.modifiers.ctrl) {
+            self.set_mode(ZoomMode::Height);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F) && i.modifiers.shift) {
+            self.set_mode(ZoomMode::Fill);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::T) && i.modifiers.ctrl) {
+            self.strip_on = !self.strip_on; // Ctrl+T toggles the strip
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Equals)) {
+            self.zoom_key(ui_rect(ctx), 1.0, ctx.input(|i| i.pointer.latest_pos()));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
+            self.zoom_key(ui_rect(ctx), -1.0, ctx.input(|i| i.pointer.latest_pos()));
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.step(1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::PageDown)) {
+            self.step(1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::PageUp)) {
+            self.step(-1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
+            self.step(-1);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
+            if !self.folder.is_empty() {
+                self.index = 0;
+                self.show_current();
+            }
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::End)) {
+            let n = self.folder.len();
+            if n > 0 {
+                self.index = n - 1;
+                self.show_current();
+            }
+        }
 
-        // wheel: on photo → zoom anchored at the pointer; over strip → page
+        // wheel: ON the photo → anchored zoom; over the letterbox, the bottom
+        // bar or the strip → page (old viewer rule; strip claims the wheel
+        // only once hovered). Ctrl+wheel zooms too (egui's Event::Zoom).
+        let area = ui_rect(ctx);
+        let img_size = self.tex.as_ref().map(|t| t.size_vec2());
+        let photo_rect = img_size.map(|s| fit_rect(area, s, &self.zoom));
         let (wheel_y, pos, strip_hot, drag_delta) =
             ctx.input(|i| (i.smooth_scroll_delta.y, i.pointer.latest_pos(), self.strip_hover, i.pointer.delta()));
+        let on_photo = pos.is_some_and(|p| photo_rect.is_some_and(|r| r.contains(p)));
+        let ctrl_zoom = ctx.input(|i| i.zoom_delta());
+        if ctrl_zoom != 1.0 && img_size.is_some() {
+            // one event per notch (no frame smoothing): direction is enough
+            let f = if ctrl_zoom > 1.0 { 1.15 } else { 1.0 / 1.15 };
+            let pt = if on_photo { pos.unwrap() } else { area.center() };
+            zoom_step(&mut self.zoom, area, img_size.unwrap(), f, pt);
+        }
         if wheel_y != 0.0 {
-            if strip_hot {
+            if strip_hot || !on_photo {
                 // egui smooths one wheel notch (~40pt) across ~10 frames, so
                 // stepping per frame jumped ~10 photos. Accumulate, step/notch.
                 self.wheel_points += wheel_y;
@@ -544,28 +615,14 @@ impl eframe::App for App {
                 }
             } else {
                 // zoom: same smoothing rule as the strip — egui spreads one
-                // notch over ~10 frames; stepping per frame zoomed 0.21x/notch
-                // and threw the photo off-screen (scale=0.12, off=-2500).
+                // notch over ~10 frames; accumulate, one step per notch.
                 self.wheel_points += wheel_y;
                 while self.wheel_points.abs() >= NOTCH {
                     let up = self.wheel_points > 0.0;
                     self.wheel_points = if up { self.wheel_points - NOTCH } else { self.wheel_points + NOTCH };
-                    // keep the pixel under the pointer still while zooming:
-                    // new_rect = pointer - (pointer - old_rect.min) * factor
                     let f = if up { 1.15 } else { 1.0 / 1.15 };
-                    let area = ui_rect(ctx);
-                    if let Some(pt) = pos {
-                        if let Some(tex) = &self.tex {
-                            let old = fit_rect(area, tex.size_vec2(), &self.zoom);
-                            self.zoom.scale *= f;
-                            if self.zoom.mode == ZoomMode::Fit {
-                                self.zoom.mode = ZoomMode::Actual; // manual zoom
-                            }
-                            let new = fit_rect(area, tex.size_vec2(), &self.zoom);
-                            self.zoom.offset += (old.min - new.min) + (old.min - pt) * (1.0 - f) / f;
-                            // ponytail: offset correction is algebra on rect corners;
-                            // exact pointer-stability verified by test below
-                        }
+                    if let (Some(s), Some(pt)) = (img_size, pos) {
+                        zoom_step(&mut self.zoom, area, s, f, pt);
                     }
                 }
             }
@@ -576,9 +633,14 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
             self.step(-1);
         }
-        // drag pan when zoomed
+        // drag pan (clamped per-axis like the old viewer; drag distance also
+        // suppresses the click-to-toggle that follows a real drag)
         if ctx.input(|i| i.pointer.primary_down()) {
             self.zoom.offset += drag_delta;
+            self.drag_accum += drag_delta.length();
+            if let Some(s) = img_size {
+                clamp_view(&mut self.zoom, area, s);
+            }
         }
 
         // drag & drop a photo → open it (session: resolve_target semantics)
@@ -613,6 +675,7 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::K)) {
             self.pick_mode = !self.pick_mode;
         }
+        let pick_armed = self.pick_mode; // click below must not also toggle fit
         if self.pick_mode {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                 if ctx.input(|i| i.pointer.primary_clicked()) {
@@ -637,11 +700,23 @@ impl eframe::App for App {
             }
         }
 
-        // double-click: fullscreen off (session rule); single click on photo = nothing
-        if ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary)) {
+        // click on the photo: toggle fit ↔ 100%; double-click: leave
+        // fullscreen first, then the same toggle (old viewer parity).
+        let dbl = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
+        let clicked = ctx.input(|i| i.pointer.primary_clicked());
+        if dbl || clicked {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-            if fs {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+            let tiny_drag = self.drag_accum < 3.0;
+            self.drag_accum = 0.0;
+            let on = on_photo && !strip_hot; // a strip tile click opens, never toggles
+            if dbl {
+                if fs {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                } else if on && tiny_drag && !pick_armed {
+                    self.toggle_fit();
+                }
+            } else if on && tiny_drag && !pick_armed {
+                self.toggle_fit();
             }
         }
 
@@ -683,10 +758,41 @@ fn ui_rect(ctx: &egui::Context) -> egui::Rect {
 }
 
 impl App {
-    fn zoom_at(&mut self, dir: f32) {
+    /// The photo is fitted with no pan (Esc close-when-fitted, click toggle).
+    fn is_fitted(&self) -> bool {
+        self.zoom.mode == ZoomMode::Fit
+            && (self.zoom.scale - 1.0).abs() < 1e-3
+            && self.zoom.offset == egui::Vec2::ZERO
+    }
+
+    /// One-shot view modes: 0 fit / 1 actual / W width / H height / Shift+F fill.
+    fn set_mode(&mut self, mode: ZoomMode) {
+        self.zoom.mode = mode;
+        self.zoom.scale = 1.0;
+        self.zoom.offset = egui::Vec2::ZERO;
+    }
+
+    /// click / double-click: toggle fit ↔ 100% (old viewer parity).
+    fn toggle_fit(&mut self) {
+        if self.is_fitted() {
+            self.set_mode(ZoomMode::Actual);
+        } else {
+            self.set_mode(ZoomMode::Fit);
+        }
+    }
+
+    /// +/− keys: zoom anchored at the pointer when it is on the photo,
+    /// from the centre otherwise (old nav-bar behaviour).
+    fn zoom_key(&mut self, area: egui::Rect, dir: f32, pos: Option<egui::Pos2>) {
+        let Some(size) = self.tex.as_ref().map(|t| t.size_vec2()) else {
+            return;
+        };
         let f = if dir > 0.0 { 1.15 } else { 1.0 / 1.15 };
-        self.zoom.scale *= f;
-        self.zoom.mode = ZoomMode::Actual;
+        let pt = match pos {
+            Some(p) if fit_rect(area, size, &self.zoom).contains(p) => p,
+            _ => area.center(),
+        };
+        zoom_step(&mut self.zoom, area, size, f, pt);
     }
 
     /// One layer: photo floats over nothing; bars draw on top.
@@ -695,11 +801,19 @@ impl App {
         // Painter is a cheap handle (Arc inside); owning it frees `ui` for
         // allocate_rect calls later in the same function.
         let painter = ui.painter().clone();
+        // The window owns the mouse everywhere: one fill of alpha 1/255 —
+        // invisible over any wallpaper, but hit-tests to us (the old viewer
+        // measured 64% of its own window belonging to the browser behind).
+        painter.rect_filled(area, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1));
 
         // photo + crossfade (old fades OUT on top — session rule)
         if let Some(tex) = self.tex.clone() {
             let size = tex.size_vec2();
             let rect = fit_rect(area, size, &self.zoom);
+            // soft drop shadow: the photo floats on the letterbox
+            for (pad, a) in [(6.0, 60u8), (14.0, 34), (26.0, 16)] {
+                painter.rect_filled(rect.expand(pad), 4.0, egui::Color32::from_black_alpha(a));
+            }
             let mut tint = egui::Color32::WHITE;
             if let Some(t) = self.fade {
                 let a = ((t.elapsed().as_secs_f32() / FADE).min(1.0) * 255.0) as u8;
@@ -719,12 +833,15 @@ impl App {
             painter.image(tex.id(), rect, uv(), egui::Color32::WHITE);
         }
 
-        // Picasa strip: navy band at the bottom, tiles 30px tall
+        // Picasa strip: navy band at the bottom (Ctrl+T hides the whole row)
+        let strip_h = if self.strip_on { TILE } else { 0.0 };
         let strip_rect = egui::Rect::from_min_size(
-            egui::pos2(area.left(), area.bottom() - TILE),
-            egui::vec2(area.width(), TILE),
+            egui::pos2(area.left(), area.bottom() - strip_h),
+            egui::vec2(area.width(), strip_h),
         );
-        painter.rect_filled(strip_rect, 0.0, egui::Color32::from_rgb(8, 9, 12));
+        if self.strip_on {
+            painter.rect_filled(strip_rect, 0.0, egui::Color32::from_rgb(8, 9, 12));
+        }
 
         // floating ⤢ top-right: only in fullscreen; leaves fullscreen, never quits
         let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -796,9 +913,26 @@ impl App {
         // tiles — collect hover/clicks, then act (borrow-checker friendly)
         let mut hot = false;
         let mut clicked: Option<usize> = None;
-        let count = self.folder.len();
+        let count = if self.strip_on { self.folder.len() } else { 0 };
         // tiles advance by their true width (aspect-preserved), like Picasa
         let mut x = area.left() + 8.0;
+        // keep the current tile in view: shift the row when it lands off-screen
+        if count > 0 {
+            let wid = |t: &egui::TextureHandle| {
+                let s = t.size_vec2();
+                (s.x * (TILE / s.y)).clamp(20.0, TILE * 2.0)
+            };
+            let mut pos = x;
+            for i in 0..self.index {
+                if let Some(t) = self.thumbs.get(&self.folder[i]) {
+                    pos += wid(t) + 2.0;
+                }
+            }
+            let cur = self.thumbs.get(&self.folder[self.index]).map(wid).unwrap_or(60.0);
+            if pos + cur > area.right() - 8.0 {
+                x -= pos + cur - (area.right() - 8.0);
+            }
+        }
         for i in 0..count {
             let Some(tex) = self.thumbs.get(&self.folder[i]) else { continue };
             let sz = tex.size_vec2();
@@ -863,6 +997,13 @@ fn fit_rect(area: egui::Rect, size: egui::Vec2, z: &Zoom) -> egui::Rect {
     if size.x <= 0.0 || size.y <= 0.0 || area.is_negative() {
         return area;
     }
+    let k = k_of(z, area, size);
+    let r = egui::Rect::from_center_size(area.center(), size * k);
+    egui::Rect::from_min_max(r.min + z.offset, r.max + z.offset)
+}
+
+/// The magnification the zoom state currently implies (img px → view px).
+fn k_of(z: &Zoom, area: egui::Rect, size: egui::Vec2) -> f32 {
     let (sx, sy) = (area.width() / size.x, area.height() / size.y);
     let k = match z.mode {
         ZoomMode::Fill => sx.max(sy),
@@ -870,9 +1011,49 @@ fn fit_rect(area: egui::Rect, size: egui::Vec2, z: &Zoom) -> egui::Rect {
         ZoomMode::Height => sy,
         ZoomMode::Actual => 1.0,
         ZoomMode::Fit => sx.min(sy),
-    } * z.scale;
-    let r = egui::Rect::from_center_size(area.center(), size * k);
-    egui::Rect::from_min_max(r.min + z.offset, r.max + z.offset)
+    };
+    k * z.scale
+}
+
+/// The old viewer's pan rule: an axis where the image FITS is centred
+/// (there is nothing to pan to); an axis where it is BIGGER pans freely so
+/// the anchor stays honoured exactly ("free while pannable, centred once
+/// the image fits" — test_zoom_anchor).
+fn clamp_view(z: &mut Zoom, area: egui::Rect, size: egui::Vec2) {
+    if size.x <= 0.0 || area.is_negative() {
+        return;
+    }
+    let ext = size * k_of(z, area, size);
+    if ext.x <= area.width() {
+        z.offset.x = 0.0;
+    }
+    if ext.y <= area.height() {
+        z.offset.y = 0.0;
+    }
+}
+
+/// One wheel/±zoom step anchored at `pt`: the image point under the cursor
+/// stays under it (old viewer rule — test_zoom_anchor ported as zoom_anchor).
+/// The fit→free transition re-bases `scale` to the CURRENT effective k first,
+/// so switching modes never jumps the magnification.
+fn zoom_step(z: &mut Zoom, area: egui::Rect, size: egui::Vec2, f: f32, pt: egui::Pos2) {
+    if size.x <= 0.0 || area.is_negative() || f <= 0.0 {
+        return;
+    }
+    let old = fit_rect(area, size, z);
+    if old.width() <= 0.0 {
+        return;
+    }
+    z.mode = ZoomMode::Actual;
+    z.scale = (old.width() / size.x) * f;
+    let new = fit_rect(area, size, z);
+    let rx = new.width() / old.width();
+    let ry = new.height() / old.height();
+    z.offset += egui::vec2(
+        pt.x - (pt.x - old.min.x) * rx - new.min.x,
+        pt.y - (pt.y - old.min.y) * ry - new.min.y,
+    );
+    clamp_view(z, area, size);
 }
 
 fn vp(b: bool) -> bool {
@@ -908,6 +1089,122 @@ mod decode_tests {
         }
         println!("mean: ({},{},{}) over {} samples", sum[0] / n, sum[1] / n, sum[2] / n, n);
         // PIL reference: dims 1600x1000, topleft ~61, mean (58,53,72)
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    const VIEW: (f32, f32) = (1000.0, 700.0);
+    const IMG: (f32, f32) = (4000.0, 3000.0);
+
+    fn area() -> egui::Rect {
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(VIEW.0, VIEW.1))
+    }
+    fn img() -> egui::Vec2 {
+        egui::vec2(IMG.0, IMG.1)
+    }
+    /// The image-space point currently under `pt` (the old test's img_point).
+    fn img_point(z: &Zoom, pt: egui::Pos2) -> egui::Pos2 {
+        let r = fit_rect(area(), img(), z);
+        egui::pos2(
+            (pt.x - r.min.x) / (r.width() / IMG.0),
+            (pt.y - r.min.y) / (r.height() / IMG.1),
+        )
+    }
+    fn drift(a: egui::Pos2, b: egui::Pos2) -> f32 {
+        (a.x - b.x).abs().max((a.y - b.y).abs())
+    }
+
+    #[test]
+    fn wheel_zoom_is_anchored_at_the_cursor() {
+        let mut z = Zoom::default(); // fit
+        let pt = egui::pos2(250.0, 200.0); // well off-centre: drift would show
+        let k0 = k_of(&z, area(), img());
+        let p0 = img_point(&z, pt);
+        for _ in 0..8 {
+            zoom_step(&mut z, area(), img(), 1.15, pt);
+        }
+        let k1 = k_of(&z, area(), img());
+        assert!(
+            (k1 / k0 - 1.15f32.powi(8)).abs() < 1e-3,
+            "fit→free must not jump the magnification: k {k0} → {k1}"
+        );
+        assert!(drift(img_point(&z, pt), p0) < 0.5, "wheel-in anchored");
+        // zoom back out while the image still fills the view: still anchored
+        for _ in 0..4 {
+            zoom_step(&mut z, area(), img(), 1.0 / 1.15, pt);
+        }
+        assert!(drift(img_point(&z, pt), p0) < 0.5, "wheel-out anchored");
+        // a different anchor must give a different result (anchor drives it)
+        let mut a = Zoom::default();
+        let mut b = Zoom::default();
+        zoom_step(&mut a, area(), img(), 1.15, egui::pos2(200.0, 150.0));
+        zoom_step(&mut b, area(), img(), 1.15, egui::pos2(800.0, 550.0));
+        assert!(
+            (fit_rect(area(), img(), &a).left() - fit_rect(area(), img(), &b).left()).abs() > 1.0,
+            "the anchor point actually drives the result"
+        );
+    }
+
+    #[test]
+    fn axes_clamp_independently() {
+        // tiny: centred on both axes (nothing to pan to)
+        let mut z = Zoom::default();
+        z.mode = ZoomMode::Actual;
+        z.scale = 0.02;
+        z.offset = egui::vec2(500.0, -300.0);
+        clamp_view(&mut z, area(), img());
+        let r = fit_rect(area(), img(), &z);
+        assert!(
+            (r.center().x - VIEW.0 / 2.0).abs() < 1.0 && (r.center().y - VIEW.1 / 2.0).abs() < 1.0,
+            "tiny zoom centres, got {:?}",
+            r.center()
+        );
+
+        // bigger than the view: panning is FREE — the old viewer honours
+        // the anchor exactly and never fights the drag ("free while
+        // pannable, centred once the image fits")
+        z.scale = 2.0;
+        z.offset = egui::vec2(77.0, -55.0);
+        clamp_view(&mut z, area(), img());
+        assert!(
+            z.offset == egui::vec2(77.0, -55.0),
+            "bigger axis pans freely, got {:?}",
+            z.offset
+        );
+
+        // wider than the view but shorter: free horizontally, centred
+        // vertically — the two axes decide alone
+        let wide = egui::vec2(4000.0, 2000.0);
+        let mut z = Zoom::default();
+        z.mode = ZoomMode::Actual;
+        z.scale = 0.26; // → 1040×520 in 1000×700
+        z.offset = egui::vec2(777.0, -555.0);
+        clamp_view(&mut z, area(), wide);
+        assert!(z.offset.x == 777.0, "wide axis stays free: {}", z.offset.x);
+        assert!(z.offset.y == 0.0, "short axis centred: {}", z.offset.y);
+        let r = fit_rect(area(), wide, &z);
+        assert!(
+            (r.center().y - VIEW.1 / 2.0).abs() < 1.0,
+            "short axis centred: {:?}",
+            r.center()
+        );
+    }
+
+    #[test]
+    fn a_fitted_axis_cannot_be_panned() {
+        // fit view: every axis fits → a drag is reset, the photo cannot be
+        // lost in the letterbox (the dizzying drift the old notes warn about)
+        let mut z = Zoom::default(); // 933×700 fitted into 1000×700
+        z.offset = egui::vec2(40.0, -30.0);
+        clamp_view(&mut z, area(), img());
+        assert!(
+            z.offset == egui::Vec2::ZERO,
+            "fitted photo centres, got {:?}",
+            z.offset
+        );
     }
 }
 
