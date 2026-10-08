@@ -174,7 +174,9 @@ impl App {
     fn show_current(&mut self) {
         let Some(p) = self.current().map(|p| p.to_path_buf()) else { return };
         self.error = None;
-        self.zoom.mode = ZoomMode::Fit;
+        if !self.zoom.locked {
+            self.zoom.mode = ZoomMode::Fit; // landing fits unless Lock Zoom
+        }
         if !self.thumbs.contains_key(&p) {
             self.queue_thumb(p.clone());
         }
@@ -320,6 +322,11 @@ impl eframe::App for App {
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+        }
+
+        // Lock Zoom (L): a landing keeps the user's scale (session rule)
+        if ctx.input(|i| i.key_pressed(egui::Key::L)) {
+            self.zoom.locked = !self.zoom.locked;
         }
 
         // wheel: on photo → zoom anchored at the pointer; over strip → page
