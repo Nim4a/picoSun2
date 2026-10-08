@@ -8,6 +8,7 @@ eframe = { version = "0.31", default-features = false, features = ["default_font
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "ico", "png", "pnm", "tga", "tiff", "webp", "bmp", "dds", "qoi", "hdr", "exr", "avif", "rayon"] }
 rayon = "1"
 arboard = "3"
+rawler = "0.8.0"
 
 [profile.release]
 opt-level = 3

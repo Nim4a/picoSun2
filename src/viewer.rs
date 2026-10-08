@@ -33,6 +33,20 @@ fn is_image(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// RAW formats rawloader 0.37 actually decodes (no CR3/GoPro — those keep
+/// the plain "unsupported" error instead of lying about support).
+const RAW_DECODE_EXTS: &[&str] = &[
+    "3fr", "ari", "arw", "cr2", "crw", "dcs", "dcr", "dng", "erf", "iiq", "kdc",
+    "mef", "mos", "mrw", "nef", "nrw", "orf", "pef", "raf", "rw2", "srw", "x3f",
+];
+
+fn is_raw(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| RAW_DECODE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Explorer-style natural sort: digit runs compare numerically (pic2 < pic10).
 fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     // ponytail: digit-run chunks only; close enough to Explorer without a locale table
@@ -113,6 +127,7 @@ pub struct App {
     strip_hover: bool,
     strip_on: bool,     // Ctrl+T shows/hides the strip (old viewer parity)
     drag_accum: f32,    // pixels dragged this press: click toggles only if tiny
+    menu_at: Option<egui::Pos2>, // right-click context menu anchor
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     decoding: Option<PathBuf>,
     tile_rx: Receiver<(PathBuf, Result<Arc<DynamicImage>, String>)>,
@@ -155,6 +170,7 @@ impl App {
             strip_hover: false,
             strip_on: true,
             drag_accum: 0.0,
+            menu_at: None,
             thumbs: HashMap::new(),
             decoding: None,
             tile_rx,
@@ -262,7 +278,7 @@ impl App {
         }
         let tx = self.tile_tx.clone();
         rayon::spawn(move || {
-            let img = read_image(&path)
+            let img = read_thumb(&path)
                 .map(|im| Arc::new(im.thumbnail((TILE * 3.0) as u32, (TILE * 3.0) as u32)));
             let _ = tx.send((path, img.map_err(|e| e.to_string())));
         });
@@ -400,11 +416,184 @@ fn spawn_master(
 }
 
 fn read_image(path: &Path) -> Result<DynamicImage, String> {
+    if is_raw(path) {
+        return read_raw(path, true);
+    }
+    decode_regular(path)
+}
+
+/// Same decode, but RAW takes the cheap no-demosaic path — a 147px thumb
+/// does not need bilinear (a full RAW demosaic per thumb was the stutter).
+fn read_thumb(path: &Path) -> Result<DynamicImage, String> {
+    if is_raw(path) {
+        return read_raw(path, false);
+    }
+    decode_regular(path)
+}
+
+fn decode_regular(path: &Path) -> Result<DynamicImage, String> {
     image::ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
         .map_err(|e| e.to_string())?
         .decode()
         .map_err(|e| e.to_string())
+}
+
+/// RAW (ARW/CR2/NEF/…): rawloader reads the sensor data; the camera's own
+/// white balance and black/white levels are applied per channel (old viewer:
+/// "16 bits with the camera's own white balance"). `smooth` = bilinear-ish
+/// demosaic for the photo; `false` = 2×2 CFA block average for thumbs.
+fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
+    let raw = rawler::decode_file(path).map_err(|e| e.to_string())?;
+    let (w, h) = (raw.width, raw.height);
+    if w < 16 || h < 16 {
+        return Err("raw too small".into());
+    }
+    // usable area: the recommended crop, else the active sensor area
+    let (l, t, cw, ch) = match raw.crop_area.or(raw.active_area) {
+        Some(r) => (
+            r.p.x.min(w.saturating_sub(16)),
+            r.p.y.min(h.saturating_sub(16)),
+            r.d.w.min(w.saturating_sub(r.p.x.min(w.saturating_sub(16)))),
+            r.d.h.min(h.saturating_sub(r.p.y.min(h.saturating_sub(16)))),
+        ),
+        None => (0, 0, w, h),
+    };
+    if cw < 8 || ch < 8 {
+        return Err("raw crop empty".into());
+    }
+
+    let wb = raw.wb_coeffs;
+    let wb_of = |c: usize| if wb[c] > 0.0 { wb[c] } else { 1.0 };
+    let white = raw.whitelevel.as_bayer_array();
+    let bl = &raw.blacklevel.levels;
+    let black: [f32; 4] = if bl.len() >= 4 {
+        [bl[0].as_f32(), bl[1].as_f32(), bl[2].as_f32(), bl[3].as_f32()]
+    } else {
+        [bl.first().map(|r| r.as_f32()).unwrap_or(0.0); 4]
+    };
+    // CFA pattern (absent for monochrome sensors → every pixel is channel 0,
+    // which the generic path turns into neutral grey)
+    let cfa = match &raw.photometric {
+        rawler::rawimage::RawPhotometricInterpretation::Cfa(cfg) => Some(&cfg.cfa),
+        _ => None,
+    };
+    let col_of = |y: usize, x: usize| cfa.map_or(0, |c| c.color_at(y, x));
+
+    // linear sensor value → display gamma (LUT: powf per pixel is 12MP×3 calls)
+    let mut lut = [0u8; 1024];
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = ((i as f32 / 1023.0).powf(1.0 / 2.2) * 255.0 + 0.5) as u8;
+    }
+    let gamma = |v: f32| lut[(v.clamp(0.0, 1.0) * 1023.0) as usize];
+    let norm = |data: &[u16], x: usize, y: usize, c: usize| -> f32 {
+        let s = data[y * w + x] as f32;
+        let blk = black[c.min(3)];
+        let wht = white[c.min(3)].max(blk + 1.0);
+        ((s - blk) / (wht - blk)).clamp(0.0, 1.0)
+    };
+
+    match &raw.data {
+        rawler::RawImageData::Integer(data) => {
+            if raw.cpp == 3 {
+                // pre-demosaiced RGB raw (some DNGs): straight normalize
+                let mut rgb = Vec::with_capacity(cw * ch * 3);
+                for y in t..t + ch {
+                    for x in l..l + cw {
+                        for c in 0..3 {
+                            let s = data[(y * w + x) * 3 + c] as f32;
+                            let blk = black[c];
+                            let wht = white[c].max(blk + 1.0);
+                            rgb.push(gamma(((s - blk) / (wht - blk)).clamp(0.0, 1.0) * wb_of(c)));
+                        }
+                    }
+                }
+                return Ok(DynamicImage::ImageRgb8(
+                    image::RgbImage::from_raw(cw as u32, ch as u32, rgb)
+                        .ok_or("raw rgb buffer")?,
+                ));
+            }
+            if raw.cpp != 1 {
+                return Err(format!("raw cpp {} not supported", raw.cpp));
+            }
+            let mut out;
+            if !smooth {
+                // thumb: average each 2×2 CFA block → one correct-color pixel
+                let (ow, oh) = (cw / 2, ch / 2);
+                out = vec![0u8; ow * oh * 3];
+                for y in 0..oh {
+                    for x in 0..ow {
+                        let mut sums = [0f32; 4];
+                        let mut cnts = [0u32; 4];
+                        for (dy, dx) in [(0usize, 0usize), (1, 0), (0, 1), (1, 1)] {
+                            let (px, py) = (x * 2 + dx + l, y * 2 + dy + t);
+                            let c = col_of(py, px).min(3);
+                            sums[c] += norm(data, px, py, c);
+                            cnts[c] += 1;
+                        }
+                        for c in 0..3 {
+                            // monochrome sensors land everything in bucket 0:
+                            // fall back to it so the thumb is grey, not black
+                            let v = if cnts[c] > 0 {
+                                sums[c] / cnts[c] as f32
+                            } else if cnts[0] > 0 {
+                                sums[0] / cnts[0] as f32
+                            } else {
+                                0.0
+                            };
+                            out[(y * ow + x) * 3 + c] = gamma(v * wb_of(c));
+                        }
+                    }
+                }
+                return Ok(DynamicImage::ImageRgb8(
+                    image::RgbImage::from_raw(ow as u32, oh as u32, out)
+                        .ok_or("raw thumb buffer")?,
+                ));
+            }
+            // photo: per-pixel demosaic — own channel from the centre, the
+            // others averaged from same-colour neighbours in a 5×5 window
+            // (works for any CFA incl. X-Trans; ponytail: O(n×25) once)
+            out = vec![0u8; cw * ch * 3];
+            for y in 0..ch {
+                for x in 0..cw {
+                    let (ax, ay) = (x + l, y + t);
+                    let own = col_of(ay, ax).min(3);
+                    let i = (y * cw + x) * 3;
+                    for c in 0..3 {
+                        let mut sum = 0.0f32;
+                        let mut n = 0u32;
+                        for dy in -2i32..=2 {
+                            for dx in -2i32..=2 {
+                                let (nx, ny) = (ax as i32 + dx, ay as i32 + dy);
+                                if nx < l as i32
+                                    || ny < t as i32
+                                    || nx >= (l + cw) as i32
+                                    || ny >= (t + ch) as i32
+                                {
+                                    continue;
+                                }
+                                let (nx, ny) = (nx as usize, ny as usize);
+                                if col_of(ny, nx) == c {
+                                    sum += norm(data, nx, ny, c);
+                                    n += 1;
+                                }
+                            }
+                        }
+                        let v = if n > 0 {
+                            sum / n as f32
+                        } else {
+                            norm(data, ax, ay, own)
+                        };
+                        out[i + c] = gamma(v * wb_of(c));
+                    }
+                }
+            }
+            Ok(DynamicImage::ImageRgb8(
+                image::RgbImage::from_raw(cw as u32, ch as u32, out).ok_or("raw buffer")?,
+            ))
+        }
+        rawler::RawImageData::Float(_) => Err("float-encoded raw not supported".into()),
+    }
 }
 
 /// Count frames of a GIF via its logical screen + image descriptors (cheap).
@@ -572,15 +761,20 @@ impl eframe::App for App {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
         }
-        // Esc: leave fullscreen, or close when already fitted (old parity)
+        // Esc: close the menu first, else leave fullscreen, else fit, else
+        // close (old parity: "leave fullscreen, or close when already fitted")
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-            if fs {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            } else if !self.is_fitted() {
-                self.set_mode(ZoomMode::Fit);
+            if self.menu_at.take().is_some() {
+                // menu closed, nothing else
             } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                if fs {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+                } else if !self.is_fitted() {
+                    self.set_mode(ZoomMode::Fit);
+                } else {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
 
@@ -588,10 +782,15 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::L)) {
             self.zoom.locked = !self.zoom.locked;
         }
-        // rotate (R): re-render the master transformed, same path as the old
-        // viewer's non-destructive edits. Flip moved to Ctrl+H (H = height).
+        // rotate (R / Shift+R): re-render the master transformed, same path
+        // as the old viewer's non-destructive edits. Flip moved to Ctrl+H.
         if ctx.input(|i| i.key_pressed(egui::Key::R) && !i.modifiers.ctrl) {
-            self.rot = (self.rot + 1) % 4;
+            let shift = ctx.input(|i| i.modifiers.shift);
+            self.rot = if shift {
+                (self.rot + 3) % 4
+            } else {
+                (self.rot + 1) % 4
+            };
             self.retexture();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::H) && i.modifiers.ctrl) {
@@ -771,7 +970,7 @@ impl eframe::App for App {
         // fullscreen first, then the same toggle (old viewer parity).
         let dbl = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
         let clicked = ctx.input(|i| i.pointer.primary_clicked());
-        if dbl || clicked {
+        if (dbl || clicked) && self.menu_at.is_none() {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             let tiny_drag = self.drag_accum < 3.0;
             self.drag_accum = 0.0;
@@ -791,6 +990,74 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.paint(ui));
+
+        // right-click context menu (old viewer: the only menu while fullscreen)
+        if ctx.input(|i| i.pointer.secondary_clicked()) {
+            self.menu_at = ctx.input(|i| i.pointer.hover_pos());
+        }
+        if let Some(mp) = self.menu_at {
+            let mut close = false;
+            let rect = egui::Area::new(egui::Id::new("p2_ctx_menu"))
+                .fixed_pos(mp)
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    egui::Frame::menu(ui.style()).show(ui, |ui| {
+                        macro_rules! item {
+                            ($label:expr, $action:expr) => {
+                                if ui.button($label).clicked() {
+                                    $action;
+                                    close = true;
+                                }
+                            };
+                        }
+                        item!("Previous photo\t\u{2190}", self.step(-1));
+                        item!("Next photo\t\u{2192}", self.step(1));
+                        ui.separator();
+                        item!("Fit to window\t0", self.set_mode(ZoomMode::Fit));
+                        item!("Actual size\t1", self.set_mode(ZoomMode::Actual));
+                        ui.separator();
+                        item!("Rotate right\tR", {
+                            self.rot = (self.rot + 1) % 4;
+                            self.retexture();
+                        });
+                        item!("Rotate left\tShift+R", {
+                            self.rot = (self.rot + 3) % 4;
+                            self.retexture();
+                        });
+                        ui.separator();
+                        let strip_label = if self.strip_on {
+                            "Hide filmstrip\tCtrl+T"
+                        } else {
+                            "Show filmstrip\tCtrl+T"
+                        };
+                        item!(strip_label, self.strip_on = !self.strip_on);
+                        let lock_label = if self.zoom.locked {
+                            "Unlock zoom\tL"
+                        } else {
+                            "Lock zoom\tL"
+                        };
+                        item!(lock_label, self.zoom.locked = !self.zoom.locked);
+                        ui.separator();
+                        item!("Color picker\tK", self.pick_mode = !self.pick_mode);
+                        item!("Save\tCtrl+S", self.save_current());
+                        ui.separator();
+                        let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                        let fs_label = if fs { "Leave fullscreen\tF" } else { "Enter fullscreen\tF" };
+                        item!(fs_label, ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs)));
+                    })
+                })
+                .response
+                .rect;
+            if close {
+                self.menu_at = None;
+            } else if ctx.input(|i| i.pointer.primary_clicked())
+                && ctx
+                    .input(|i| i.pointer.hover_pos())
+                    .map_or(false, |p| !rect.contains(p))
+            {
+                self.menu_at = None; // click outside closes
+            }
+        }
 
         // fade animating → keep painting
         if self.fade.is_some() {
@@ -1285,6 +1552,54 @@ mod zoom_tests {
             "fitted photo centres, got {:?}",
             z.offset
         );
+    }
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+
+    /// A real Sony ARW (raw.pixls.us, ILCE-7RM5): decodes, sane dimensions,
+    /// and the white balance/levels produce a roughly neutral photo — a
+    /// channel scaled by the wrong WB convention lands far from the others.
+    #[test]
+    fn decode_sample_arw() {
+        let p = Path::new(r"Z:\hermes\projects\picoSun2\testdata\sample.arw");
+        if !p.exists() {
+            eprintln!("no ARW sample on this machine, skipping");
+            return;
+        }
+        let img = read_raw(p, true).expect("arw decode");
+        println!("arw: {}x{}", img.width(), img.height());
+        assert!(img.width() > 1000 && img.height() > 700, "sensor dims");
+
+        let rgb = img.to_rgb8();
+        let mut sums = [0f64; 3];
+        let mut n = 0f64;
+        for px in rgb.chunks_exact(4001) {
+            // prime stride: samples every channel across the whole frame
+            sums[0] += px[0] as f64;
+            sums[1] += px[1] as f64;
+            sums[2] += px[2] as f64;
+            n += 1.0;
+        }
+        let mean = [sums[0] / n, sums[1] / n, sums[2] / n];
+        println!("mean RGB: {:.0},{:.0},{:.0}", mean[0], mean[1], mean[2]);
+        for (c, m) in mean.iter().enumerate() {
+            assert!(*m > 10.0 && *m < 245.0, "channel {c} mean {m}");
+        }
+        let mn = mean.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mx = mean.iter().cloned().fold(0.0f64, f64::max);
+        assert!(
+            mx / mn.max(1.0) < 2.5,
+            "channels wildly apart (WB/level bug): {:?}",
+            mean
+        );
+
+        // thumb path: 2×2 CFA average, roughly half size, also sane
+        let thumb = read_raw(p, false).expect("arw thumb decode");
+        println!("thumb: {}x{}", thumb.width(), thumb.height());
+        assert!(thumb.width() > 500 && thumb.width() < img.width());
     }
 }
 
