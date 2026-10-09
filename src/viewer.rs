@@ -290,7 +290,19 @@ impl App {
             return;
         }
         let tx = self.tile_tx.clone();
-        rayon::spawn(move || {
+        // ponytail: TILES go to a SEPARATE 2-thread pool. Spawning them on the
+        // global rayon pool let 87 thumb decodes (400ms each on V:) compete
+        // with the master decode — the UI stayed responsive but the photo took
+        // seconds to land. Tiles are cosmetic; the master gets its own pool.
+        static TILE_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+        let pool = TILE_POOL.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .thread_name(|i| format!("p2-tile-{i}"))
+                .build()
+                .expect("tile pool")
+        });
+        pool.spawn(move || {
             let img = read_thumb(&path)
                 .map(|im| Arc::new(im.thumbnail((TILE * 3.0) as u32, (TILE * 3.0) as u32)));
             let _ = tx.send((path, img.map_err(|e| e.to_string())));
@@ -551,6 +563,9 @@ fn read_image(path: &Path) -> Result<DynamicImage, String> {
 
 /// Same decode, but RAW takes the cheap no-demosaic path — a 147px thumb
 /// does not need bilinear (a full RAW demosaic per thumb was the stutter).
+/// ponytail: a tile decode is ~400ms (full 5184x3456 → thumbnail) on V:, so
+/// the caller caps the queue and a dedicated 2-thread pool keeps the master
+/// decode fast (see queue_thumb). No downscale here — full-res is served.
 fn read_thumb(path: &Path) -> Result<DynamicImage, String> {
     if is_raw(path) {
         return read_raw(path, false);
@@ -1427,7 +1442,8 @@ impl App {
         // preload: decode every tile the strip can actually show right now,
         // not just the immediate neighbours — at the end of a long folder the
         // visible window (30 tiles) would otherwise stay blank because only
-        // ±1 around the current index was ever queued.
+        // ±1 around the current index was ever queued. Tiles now run on their
+        // own 2-thread pool (see queue_thumb), so the master is unaffected.
         if self.strip_on {
             let vis_start = start.min(count);
             let mut vis_end = (vis_start + 1).min(count);
