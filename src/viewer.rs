@@ -997,6 +997,12 @@ impl eframe::App for App {
             }
         }
 
+        // middle-click on the photo: toggle fullscreen ↔ windowed
+        if ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Middle)) && on_photo {
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+        }
+
         // the whole window is one layer: photo floats, desktop shows through
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
