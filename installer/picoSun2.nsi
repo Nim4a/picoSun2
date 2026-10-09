@@ -1,7 +1,7 @@
 ; picoSun2 installer — portable app folder -> user-local install
 ; Run: makensis.exe picoSun2.nsi
 !define APP "picoSun2"
-!define VER "0.1.0"
+!define VER "2.0.0"
 !define PUB "Nim4a"
 
 Name "${APP}"
