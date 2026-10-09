@@ -585,25 +585,14 @@ fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
             // where nested par_* SATURATED the pool and serialised (12.4s vs
             // 3.8s for 26MP). The master pool is multi-threaded now, so the
             // rows parallelise for real. Full resolution preserved — only the
-            // loop is parallel. col_of() is the hot 5×5 cost: hoist it to a
-            // 2×2-periodic lookup (CFA tiles every 2px) so it runs ~4× less.
+            // loop is parallel. col_of() per pixel is the correct CFA source:
+            // a 2×2-parity hoist broke colours on ARWs with a crop offset
+            // (the CFA origin is NOT always the crop origin — R/G/B swapped).
             use rayon::prelude::*;
             out.par_chunks_mut(cw * 3).enumerate().for_each(|(y, row)| {
-                // CFA is 2×2-periodic: the colour of (y,x) only depends on
-                // (y%2, x%2) relative to the crop origin.
-                let c00 = col_of(y + t, l).min(3);
-                let c10 = col_of(y + t, l + 1).min(3);
-                let c01 = col_of(y + t + 1, l).min(3);
-                let c11 = col_of(y + t + 1, l + 1).min(3);
                 for x in 0..cw {
                     let (ax, ay) = (x + l, y + t);
-                    // parity-based colour index — no per-pixel CFA lookup
-                    let own = match ((ay - t) & 1, (ax - l) & 1) {
-                        (0, 0) => c00,
-                        (0, 1) => c10,
-                        (1, 0) => c01,
-                        _ => c11,
-                    };
+                    let own = col_of(ay, ax).min(3);
                     for c in 0..3 {
                         let mut sum = 0.0f32;
                         let mut n = 0u32;
@@ -618,13 +607,7 @@ fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
                                     continue;
                                 }
                                 let (nx, ny) = (nx as usize, ny as usize);
-                                let col = match ((ny - t) & 1, (nx - l) & 1) {
-                                    (0, 0) => c00,
-                                    (0, 1) => c10,
-                                    (1, 0) => c01,
-                                    _ => c11,
-                                };
-                                if col == c {
+                                if col_of(ny, nx) == c {
                                     sum += norm(data, nx, ny, c);
                                     n += 1;
                                 }
