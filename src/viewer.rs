@@ -138,6 +138,7 @@ pub struct App {
     wheel_points: f32, // strip scroll: accumulate egui's smoothed points, step per notch
     last_notch: Instant,
     strip_hover: bool,
+    debug_logged: bool,
     strip_on: bool,     // Ctrl+T shows/hides the strip (old viewer parity)
     drag_accum: f32,    // pixels dragged this press: click toggles only if tiny
     menu_at: Option<egui::Pos2>, // right-click context menu anchor
@@ -185,6 +186,7 @@ impl App {
             wheel_points: 0.0,
             last_notch: Instant::now(),
             strip_hover: false,
+            debug_logged: false,
             strip_on: true,
             queued_tiles: HashSet::new(),
             drag_accum: 0.0,
@@ -230,6 +232,7 @@ impl App {
         });
         self.folder = files;
         self.index = self.folder.iter().position(|p| p == anchor).unwrap_or(0);
+        self.queued_tiles.clear(); // new folder: in-flight queues are stale
     }
 
     /// Explicit open (arg, double-click, drop): instant-first.
@@ -291,10 +294,22 @@ impl App {
 
     /// Decode one small tile on the worker pool (never blocks the UI).
     fn queue_thumb(&mut self, path: PathBuf) {
-        // ponytail: dedupe on BOTH decoded and in-flight. Checking only
-        // `thumbs` re-spawned every queued tile every frame; the tile pool
-        // (4-8 threads) drowned and tiles past the first few stayed blank.
+        // ponytail: dedupe on BOTH decoded and in-flight.
         if self.thumbs.contains_key(&path) || !self.queued_tiles.insert(path.clone()) {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("Z:\\tmp\\p2_debug_log.txt")
+            {
+                let _ = writeln!(
+                    f,
+                    "P2_DEBUG queue_thumb: SKIP {} thumbs={} queued={}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    self.thumbs.len(),
+                    self.queued_tiles.len()
+                );
+            }
             return;
         }
         let tx = self.tile_tx.clone();
@@ -392,10 +407,6 @@ impl App {
             match res {
                 Ok(img) => {
                     let tex = upload(ctx, &path, &img);
-                    // tile for the photo we're now on = instant feedback:
-                    // show it unless the full master is already on screen
-                    // (the old gate on `decoding` hid tiles during the whole
-                    // notch→settle window — the slow-scroll lag)
                     let is_current = self.current() == Some(path.as_path());
                     let master_shown = self.tex.as_ref().map_or(false, |t| {
                         self.master_tex
@@ -406,9 +417,36 @@ impl App {
                         self.prev_tex = None;
                         self.tex = Some(tex.clone());
                     }
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("Z:\\tmp\\p2_debug_log.txt")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "P2_DEBUG poll: OK {} thumbs={}",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            self.thumbs.len()
+                        );
+                    }
                     self.thumbs.insert(path, tex);
                 }
-                Err(_) => {} // a bad tile just stays blank in the strip
+                Err(e) => {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("Z:\\tmp\\p2_debug_log.txt")
+                    {
+                        let _ = writeln!(
+                            f,
+                            "P2_DEBUG poll: ERR {} {}",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            e
+                        );
+                    }
+                }
             }
         }
         while let Ok((path, res)) = self.master_rx.try_recv() {
@@ -1412,6 +1450,14 @@ impl App {
             if pos + cur > area.right() - 8.0 {
                 let over = pos + cur - (area.right() - 8.0);
                 x -= over;
+                // ponytail: pos is estimated with fallback widths; if every tile
+                // before the current one is undecoded, over can exceed the whole
+                // strip width and x goes negative — tiles then draw off-screen
+                // and the strip reads black. Floor x at the left edge; the
+                // walk-back below still skips fully off-screen tiles.
+                if x < area.left() + 8.0 {
+                    x = area.left() + 8.0;
+                }
                 // draw only tiles that stay on screen after the shift:
                 // walk back until the previous tile is fully left of the view
                 let limit = area.right() - 8.0 - cur; // == pos - over
@@ -1482,10 +1528,24 @@ impl App {
                 xw += AVG_TILE + 2.0;
                 vis_end += 1;
             }
-            // ponytail: AVG_TILE is an estimate; a folder of wide tiles pushes
-            // the real visible window past vis_end. Over-queue by 10 — decode
-            // is deduped and cached, so the extra tiles are never wasted.
+            // ponytail: over-queue by 10 — decode is deduped and cached.
             vis_end = (vis_end + 10).min(count);
+            // ponytail: one-shot debug — remove once the fast-scroll bug is closed.
+            if !self.debug_logged {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("Z:\\tmp\\p2_debug_log.txt")
+                {
+                    let _ = writeln!(
+                        f,
+                        "P2_DEBUG preload: index={} count={} start={} vis_start={} vis_end={} thumbs={} queued={}",
+                        self.index, count, start, vis_start, vis_end, self.thumbs.len(), self.queued_tiles.len()
+                    );
+                    self.debug_logged = true;
+                }
+            }
             for i in vis_start..vis_end {
                 if let Some(n) = self.folder.get(i) {
                     if !self.thumbs.contains_key(n) {
