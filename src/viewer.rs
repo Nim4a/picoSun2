@@ -404,10 +404,15 @@ impl App {
     }
 }
 
-/// Masters decode AND convert on their own single thread: the RGB→RGBA
-/// conversion of a 12MP photo (~48MB) used to hitch the UI thread for
-/// 40-80ms on every landing; only the GPU upload stays on the UI side.
-/// A thumb storm on the global pool can also never delay this decode.
+/// Masters decode AND convert on their own pool: the RGB→RGBA conversion of
+/// a 12MP photo (~48MB) used to hitch the UI thread for 40-80ms on every
+/// landing; only the GPU upload stays on the UI side.
+///
+/// The pool is MULTI-THREADED on purpose: the RAW demosaic is a 26MP
+/// par_chunks_mut loop, and on a 1-thread pool that nested parallelism
+/// saturates the pool and serialises (measured 12.4s vs 3.8s on the global
+/// pool). Letting the master pool own several cores keeps the demosaic fast
+/// while still isolating it from the thumb storm on the global pool.
 fn spawn_master(
     path: PathBuf,
     tx: Sender<(PathBuf, Result<egui::ColorImage, String>)>,
@@ -415,7 +420,7 @@ fn spawn_master(
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     let pool = POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
+            .num_threads(rayon::current_num_threads().max(2))
             .thread_name(|i| format!("p2-master-{i}"))
             .build()
             .expect("master pool")
@@ -576,13 +581,29 @@ fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
             // others averaged from same-colour neighbours in a 5×5 window
             // (works for any CFA incl. X-Trans)
             out = vec![0u8; cw * ch * 3];
-            // ponytail: 650M window samples at 26MP — one thread needed
-            // 5-7s and the RAW load felt hung; rows parallelize for free
+            // ponytail: this used to run inside spawn_master's 1-thread pool,
+            // where nested par_* SATURATED the pool and serialised (12.4s vs
+            // 3.8s for 26MP). The master pool is multi-threaded now, so the
+            // rows parallelise for real. Full resolution preserved — only the
+            // loop is parallel. col_of() is the hot 5×5 cost: hoist it to a
+            // 2×2-periodic lookup (CFA tiles every 2px) so it runs ~4× less.
             use rayon::prelude::*;
             out.par_chunks_mut(cw * 3).enumerate().for_each(|(y, row)| {
+                // CFA is 2×2-periodic: the colour of (y,x) only depends on
+                // (y%2, x%2) relative to the crop origin.
+                let c00 = col_of(y + t, l).min(3);
+                let c10 = col_of(y + t, l + 1).min(3);
+                let c01 = col_of(y + t + 1, l).min(3);
+                let c11 = col_of(y + t + 1, l + 1).min(3);
                 for x in 0..cw {
                     let (ax, ay) = (x + l, y + t);
-                    let own = col_of(ay, ax).min(3);
+                    // parity-based colour index — no per-pixel CFA lookup
+                    let own = match ((ay - t) & 1, (ax - l) & 1) {
+                        (0, 0) => c00,
+                        (0, 1) => c10,
+                        (1, 0) => c01,
+                        _ => c11,
+                    };
                     for c in 0..3 {
                         let mut sum = 0.0f32;
                         let mut n = 0u32;
@@ -597,7 +618,13 @@ fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
                                     continue;
                                 }
                                 let (nx, ny) = (nx as usize, ny as usize);
-                                if col_of(ny, nx) == c {
+                                let col = match ((ny - t) & 1, (nx - l) & 1) {
+                                    (0, 0) => c00,
+                                    (0, 1) => c10,
+                                    (1, 0) => c01,
+                                    _ => c11,
+                                };
+                                if col == c {
                                     sum += norm(data, nx, ny, c);
                                     n += 1;
                                 }
@@ -1444,6 +1471,75 @@ mod decode_tests {
         }
         println!("mean: ({},{},{}) over {} samples", sum[0] / n, sum[1] / n, sum[2] / n, n);
         // PIL reference: dims 1600x1000, topleft ~61, mean (58,53,72)
+    }
+
+    /// Where does the load time actually go? decode vs the RGB→RGBA
+    /// conversion that used to run on the UI thread. Fails only if decode
+    /// takes absurdly long (>5s for a 1600x1000 JPEG), not on timing noise.
+    #[test]
+    fn decode_timing_pic1() {
+        let p = std::path::Path::new(r"Z:\hermes\picasa-photo-viewer\testpics\pic1.jpg");
+        let t0 = std::time::Instant::now();
+        let img = read_image(p).expect("decode failed");
+        let t1 = std::time::Instant::now();
+        let cimg = to_color_image(&img);
+        let t2 = std::time::Instant::now();
+        let d = img.width() * img.height();
+        eprintln!(
+            "decode {:>7.1}ms  convert {:>7.1}ms  total {:>7.1}ms  ({}x{}, {:.1}MP)",
+            t1.duration_since(t0).as_secs_f64() * 1e3,
+            t2.duration_since(t1).as_secs_f64() * 1e3,
+            t2.duration_since(t0).as_secs_f64() * 1e3,
+            img.width(),
+            img.height(),
+            d as f64 / 1e6
+        );
+        let total = t2.duration_since(t0).as_secs_f64();
+        assert!(total < 5.0, "decode+convert took {total:.2}s — a real regression");
+    }
+
+    /// The real RAW path the user hit: full 26MP a7R decode + demosaic +
+    /// ColorImage conversion, all on the master worker thread. This is what
+    /// the "loading is slow" report measures when the file is an ARW.
+    #[test]
+    fn decode_timing_arw() {
+        let p = std::path::Path::new(r"Z:\hermes\projects\picoSun2\testdata\sample.arw");
+        if !p.exists() {
+            return;
+        }
+        let t0 = std::time::Instant::now();
+        // Reproduce the production master pool exactly: spawn_master runs the
+        // decode on a multi-thread rayon (the 1-thread version made the 26MP
+        // par_chunks_mut demosaic serialise — 12.4s vs 3.8s).
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads().max(2))
+            .build()
+            .unwrap();
+        let (img, t1_inner) = pool.install(|| {
+            let t = std::time::Instant::now();
+            let img = read_raw(p, true).expect("arw decode");
+            (img, t)
+        });
+        let t1 = std::time::Instant::now();
+        let cimg = to_color_image(&img);
+        let t2 = std::time::Instant::now();
+        // split the 4s: rawler file read vs demosaic. Re-open so the timing
+        // separates the two phases of read_raw().
+        let t3 = std::time::Instant::now();
+        let _raw2 = rawler::decode_file(p).ok();
+        let t4 = std::time::Instant::now();
+        eprintln!(
+            "ARW decode {:>7.1}ms  convert {:>7.1}ms  total {:>7.1}ms  | rawler::decode_file alone {:>7.1}ms  ({}x{}, {:.1}MP)",
+            t1.duration_since(t1_inner).as_secs_f64() * 1e3,
+            t2.duration_since(t1).as_secs_f64() * 1e3,
+            t2.duration_since(t0).as_secs_f64() * 1e3,
+            t4.duration_since(t3).as_secs_f64() * 1e3,
+            img.width(),
+            img.height(),
+            (img.width() * img.height()) as f64 / 1e6
+        );
+        // a 26MP demosaic on one thread is seconds; that is the visible hitch
+        assert!(t2.duration_since(t0).as_secs_f64() < 30.0, "ARW decode absurdly slow");
     }
 }
 
