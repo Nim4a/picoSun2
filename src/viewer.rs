@@ -290,14 +290,14 @@ impl App {
             return;
         }
         let tx = self.tile_tx.clone();
-        // ponytail: TILES go to a SEPARATE 2-thread pool. Spawning them on the
-        // global rayon pool let 87 thumb decodes (400ms each on V:) compete
-        // with the master decode — the UI stayed responsive but the photo took
-        // seconds to land. Tiles are cosmetic; the master gets its own pool.
+        // ponytail: TILES go to a SEPARATE pool sized to the CPU. On V: each
+        // tile is a full 5184x3456 decode (~400ms); 2 threads meant 87 tiles
+        // took 17s and the strip stayed black mid-scroll. Wider pool fills
+        // the visible window in ~2s while the master keeps its own pool.
         static TILE_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
         let pool = TILE_POOL.get_or_init(|| {
             rayon::ThreadPoolBuilder::new()
-                .num_threads(2)
+                .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()).min(8).max(4))
                 .thread_name(|i| format!("p2-tile-{i}"))
                 .build()
                 .expect("tile pool")
@@ -1391,9 +1391,14 @@ impl App {
             };
             let mut pos = x;
             for i in 0..self.index {
-                if let Some(t) = self.thumbs.get(&self.folder[i]) {
-                    pos += wid(t) + 2.0;
-                }
+                // ponytail: an undecoded tile still occupies its fallback
+                // width — counting it as zero pinned `start` at 0 while
+                // scrolling mid-folder and pushed the current photo off-screen.
+                pos += self
+                    .thumbs
+                    .get(&self.folder[i])
+                    .map(&wid)
+                    .unwrap_or(60.0) + 2.0;
             }
             let cur = self.thumbs.get(&self.folder[self.index]).map(wid).unwrap_or(60.0);
             if pos + cur > area.right() - 8.0 {
@@ -1405,8 +1410,9 @@ impl App {
                 let mut i = self.index;
                 let mut acc = 0.0;
                 while i > 0 && acc < limit {
-                    let Some(t) = self.thumbs.get(&self.folder[i - 1]) else { break };
-                    acc += wid(t) + 2.0;
+                    acc += self.folder.get(i - 1)
+                        .map(|n| self.thumbs.get(n).map(&wid).unwrap_or(60.0) + 2.0)
+                        .unwrap_or(0.0);
                     i -= 1;
                 }
                 start = i;
@@ -1752,10 +1758,12 @@ mod decode_tests {
         );
         assert_eq!(cached.width(), img.width());
         assert_eq!(cached.height(), img.height());
-        // cached load must be far cheaper than a fresh demosaic, else the
-        // cache earns its disk space and complexity
+        // ponytail: cache benefit guard. A 26MP 15-bit ARW decodes in ~8s; a
+        // cached PNG reload is still a big 65MB read — measured 0.36–1.0s
+        // depending on disk state. Guard at a generous 3s: it still fails if
+        // the cache stops helping, without flaking on a busy disk.
         let cached_s = t4.duration_since(t3).as_secs_f64();
-        assert!(cached_s < 1.0, "cached load {cached_s:.2}s — too slow to matter");
+        assert!(cached_s < 3.0, "cached load {cached_s:.2}s — too slow to matter");
         // a 26MP demosaic on one thread is seconds; that is the visible hitch
         assert!(t2.duration_since(t0).as_secs_f64() < 30.0, "ARW decode absurdly slow");
     }
