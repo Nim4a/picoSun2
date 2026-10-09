@@ -448,29 +448,20 @@ fn spawn_master(
     });
 }
 
-/// Disk-backed cache of the DECODED photo (post-demosaic, full resolution).
-/// Key = the source file path hashed, so two files with the same name never
-/// collide and the file can be renamed without losing the cache. Lives under
-/// $LOCALAPPDATA/picosun2/cache (Z:), never C:.
-fn disk_cache_dir() -> std::path::PathBuf {
-    std::path::Path::new(&cache_root()).join("picosun2").join("cache")
+/// The cache lives NEXT TO the photo: `img.arw.p2cache.png` + a `.meta`
+/// sidecar with the source's mtime+len (cheap stdlib stat, no DB). No central
+/// cache dir, no hashing — the user can see, move, and delete a cache entry
+/// alongside its photo.
+fn cache_sidecar(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".p2cache.png");
+    std::path::PathBuf::from(s)
 }
 
-fn cache_root() -> String {
-    std::env::var("LOCALAPPDATA")
-        .unwrap_or_else(|_| "Z:\\hermes\\cache".into())
-}
-
-fn disk_cache_key(path: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::hash::DefaultHasher::new();
-    path.hash(&mut h);
-    let n = h.finish();
-    format!("{:016x}.png", n)
-}
-
-fn disk_cache_path(path: &Path) -> std::path::PathBuf {
-    disk_cache_dir().join(disk_cache_key(path))
+fn cache_meta_sidecar(path: &Path) -> std::path::PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".p2cache.meta");
+    std::path::PathBuf::from(s)
 }
 
 /// A cached PNG is only valid while the source file has not changed. Store
@@ -480,7 +471,7 @@ fn disk_cache_path(path: &Path) -> std::path::PathBuf {
 /// the same second share a stamp — a file rewriting itself that fast is not
 /// a photo viewer's problem.
 fn cache_is_fresh(path: &Path) -> bool {
-    let meta = disk_cache_path(path).with_extension("meta");
+    let meta = cache_meta_sidecar(path);
     let Ok(src) = std::fs::metadata(path) else {
         return false;
     };
@@ -510,14 +501,12 @@ fn save_cache_meta(path: &Path) {
                 .unwrap_or(0),
             src.len()
         );
-        let _ = std::fs::write(disk_cache_path(path).with_extension("meta"), s);
+        let _ = std::fs::write(cache_meta_sidecar(path), s);
     }
 }
 
 fn save_to_disk_cache(path: &Path, img: &DynamicImage) {
-    let dir = disk_cache_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let p = disk_cache_path(path);
+    let p = cache_sidecar(path);
     let mut buf = std::io::Cursor::new(Vec::new());
     if img.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
         let _ = std::fs::write(&p, buf.into_inner());
@@ -525,8 +514,7 @@ fn save_to_disk_cache(path: &Path, img: &DynamicImage) {
 }
 
 fn load_from_disk_cache(path: &Path) -> Option<Arc<DynamicImage>> {
-    let p = disk_cache_path(path);
-    let bytes = std::fs::read(&p).ok()?;
+    let bytes = std::fs::read(cache_sidecar(path)).ok()?;
     let img = image::load_from_memory(&bytes).ok()?;
     Some(Arc::new(img))
 }
@@ -540,7 +528,7 @@ fn read_image(path: &Path) -> Result<DynamicImage, String> {
             return Ok((*img).clone());
         }
         // stale: the source changed since caching — drop and re-decode
-        let _ = std::fs::remove_file(disk_cache_path(path));
+        let _ = std::fs::remove_file(cache_sidecar(path));
     }
     if is_raw(path) {
         return read_raw(path, true);
@@ -1656,6 +1644,9 @@ mod decode_tests {
         if !p.exists() {
             return;
         }
+        // cold start: drop any sidecar a previous test left next to the file
+        let _ = std::fs::remove_file(cache_sidecar(p));
+        let _ = std::fs::remove_file(cache_meta_sidecar(p));
         let t0 = std::time::Instant::now();
         // Reproduce the production master pool exactly: spawn_master runs the
         // decode on a multi-thread rayon (the 1-thread version made the 26MP
