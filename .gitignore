@@ -1,2 +1,4 @@
 /target
 testdata/*.arw
+*.p2cache.png
+*.p2cache.meta
