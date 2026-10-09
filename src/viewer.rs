@@ -1482,6 +1482,10 @@ impl App {
                 xw += AVG_TILE + 2.0;
                 vis_end += 1;
             }
+            // ponytail: AVG_TILE is an estimate; a folder of wide tiles pushes
+            // the real visible window past vis_end. Over-queue by 10 — decode
+            // is deduped and cached, so the extra tiles are never wasted.
+            vis_end = (vis_end + 10).min(count);
             for i in vis_start..vis_end {
                 if let Some(n) = self.folder.get(i) {
                     if !self.thumbs.contains_key(n) {
