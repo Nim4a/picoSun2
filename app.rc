@@ -1,0 +1,4 @@
+// Application icon embedded in the exe (Explorer, taskbar, shortcuts).
+#include <windows.h>
+
+1 ICON "icons/icon_main.ico"

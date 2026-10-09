@@ -37,11 +37,12 @@ Section "Install"
   WriteUninstaller "$INSTDIR\uninstall.exe"
   SetOutPath "$INSTDIR"
 
-  # desktop shortcut (with icon) — run the exe directly, no cmd wrapper
-  CreateShortCut "$DESKTOP\picosun2.lnk" "$INSTDIR\picosun2.exe" "" "$INSTDIR\icon_main.ico"
+  # desktop + start menu shortcuts: icon comes from the exe's own resource,
+  # no sidecar .ico needed (the exe embeds icon_main.ico via build.rs)
+  CreateShortCut "$DESKTOP\picosun2.lnk" "$INSTDIR\picosun2.exe"
   # start menu shortcut
   CreateDirectory "$SMPROGRAMS\picosun2"
-  CreateShortCut "$SMPROGRAMS\picosun2\picosun2.lnk" "$INSTDIR\picosun2.exe" "" "$INSTDIR\icon_main.ico"
+  CreateShortCut "$SMPROGRAMS\picosun2\picosun2.lnk" "$INSTDIR\picosun2.exe"
   CreateShortCut "$SMPROGRAMS\picosun2\Uninstall.lnk" "$INSTDIR\uninstall.exe"
   # registry: silent
   WriteRegStr HKCU "Software\picoSun2" "InstallDir" "$INSTDIR"
