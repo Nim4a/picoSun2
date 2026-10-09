@@ -26,7 +26,20 @@ const IMAGE_EXTS: &[&str] = &[
     "drf", "eip", "obm", "rwz",
 ];
 
+/// Our own cache sidecars are NOT photos. `img.arw.p2cache.png` ends in
+/// `.png`, so without this the folder scan counts every cached photo twice
+/// and the filmstrip fills with 26MB PNGs instead of real photos.
+fn is_cache_sidecar(p: &Path) -> bool {
+    p.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".p2cache.png") || n.ends_with(".p2cache.meta"))
+        .unwrap_or(false)
+}
+
 fn is_image(p: &Path) -> bool {
+    if is_cache_sidecar(p) {
+        return false;
+    }
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
@@ -1608,6 +1621,22 @@ mod decode_tests {
             !cache_is_fresh(&src),
             "stale cache after source mtime/len change"
         );
+    }
+
+    /// Cache sidecars must never be counted as photos: `IMG_1.JPG.p2cache.png`
+    /// ends in .png, and without the filter the folder scan sees every cached
+    /// photo twice (87 photos → 174 entries, filmstrip half-empty of real art).
+    #[test]
+    fn cache_sidecar_is_not_an_image() {
+        let p = |s: &str| std::path::PathBuf::from(s);
+        assert!(!is_image(&p("IMG_1.JPG.p2cache.png")));
+        assert!(!is_image(&p("IMG_1.JPG.p2cache.meta")));
+        assert!(!is_image(&p("shot.arw.p2cache.png")));
+        // real photos still count
+        assert!(is_image(&p("IMG_1.JPG")));
+        assert!(is_image(&p("shot.arw")));
+        assert!(is_image(&p("a.png")));
+        assert!(is_image(&p("b.PNG")));
     }
 
     /// Where does the load time actually go? decode vs the RGB→RGBA
