@@ -46,6 +46,17 @@ Section "Install"
   CreateShortCut "$SMPROGRAMS\picosun2\Uninstall.lnk" "$INSTDIR\uninstall.exe"
   # registry: silent
   WriteRegStr HKCU "Software\picoSun2" "InstallDir" "$INSTDIR"
+  # Applications\<exe>: what the shell uses for the "Open with" menu entry --
+  # name + icon + friendly verb. Without this the entry shows no icon and a
+  # bare filename.
+  WriteRegStr HKCU "Software\Classes\Applications\picosun2.exe" "" "picoSun2"
+  WriteRegStr HKCU "Software\Classes\Applications\picosun2.exe" "FriendlyAppName" "picoSun2"
+  WriteRegStr HKCU "Software\Classes\Applications\picosun2.exe\DefaultIcon" "" "$INSTDIR\picosun2.exe,0"
+  WriteRegStr HKCU "Software\Classes\Applications\picosun2.exe\shell\open\command" "" '"$INSTDIR\picosun2.exe" "%1"'
+  # SupportedTypes: keep picosun2 in "Open with" for photos/RAW, never default
+  WriteRegStr HKCU "Software\Classes\Applications\picosun2.exe\SupportedTypes" ".jpg" ""
+  WriteRegStr HKCU "Software\Classes\Applications\picosun2.exe\SupportedTypes" ".png" ""
+  WriteRegStr HKCU "Software\Classes\Applications\picosun2.exe\SupportedTypes" ".arw" ""
   # file associations (user-level, reversible): photos -> photo icon,
   # RAW -> raw icon, HDR -> hdr icon, animations -> anim icon. picoSun2 is
   # registered as OpenWith for everything, default for nothing -- the user
@@ -263,5 +274,6 @@ Section "Uninstall"
   DeleteRegValue HKCU "Software\Classes\.gifv\OpenWithProgids" "picoSun2.anim"
   DeleteRegValue HKCU "Software\Classes\.webp\OpenWithProgids" "picoSun2.anim"
   DeleteRegValue HKCU "Software\Classes\3gp\OpenWithProgids" "picoSun2.photo"
+  DeleteRegKey HKCU "Software\Classes\Applications\picosun2.exe"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\picoSun2"
 SectionEnd
