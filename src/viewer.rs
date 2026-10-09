@@ -1419,11 +1419,24 @@ impl App {
             }
         }
         for i in start..count {
-            let Some(tex) = self.thumbs.get(&self.folder[i]) else { continue };
-            let sz = tex.size_vec2();
-            let w = (sz.x * (TILE / sz.y)).clamp(20.0, TILE * 2.0);
-            let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(w, TILE));
-            painter.image(tex.id(), r, uv(), egui::Color32::WHITE);
+            // ponytail: an undecoded tile still gets a slot + an interactive
+            // rect (grey placeholder). Skipping it left a hole with no Sense,
+            // so a wheel over the black stretch fell through to the photo path
+            // — scrolling went backwards and zoomed instead of paging.
+            let (w, r) = match self.thumbs.get(&self.folder[i]) {
+                Some(tex) => {
+                    let sz = tex.size_vec2();
+                    let w = (sz.x * (TILE / sz.y)).clamp(20.0, TILE * 2.0);
+                    let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(w, TILE));
+                    painter.image(tex.id(), r, uv(), egui::Color32::WHITE);
+                    (w, r)
+                }
+                None => {
+                    let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(60.0, TILE));
+                    painter.rect_filled(r, 0.0, egui::Color32::from_rgb(26, 27, 30));
+                    (60.0, r)
+                }
+            };
             if i == self.index {
                 painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5f32, egui::Color32::from_rgb(47, 127, 196)), egui::StrokeKind::Inside);
             }
