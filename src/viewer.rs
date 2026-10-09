@@ -3,7 +3,7 @@
 
 use eframe::egui;
 use image::DynamicImage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -142,6 +142,10 @@ pub struct App {
     drag_accum: f32,    // pixels dragged this press: click toggles only if tiny
     menu_at: Option<egui::Pos2>, // right-click context menu anchor
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
+    // ponytail: queued-but-not-yet-decoded tiles. Without this the preload
+    // loop re-spawned every in-flight tile every frame (60/s × 30 tiles),
+    // flooding the tile pool so later tiles never decoded.
+    queued_tiles: HashSet<PathBuf>,
     decoding: Option<PathBuf>,
     tile_rx: Receiver<(PathBuf, Result<Arc<DynamicImage>, String>)>,
     tile_tx: Sender<(PathBuf, Result<Arc<DynamicImage>, String>)>,
@@ -182,6 +186,7 @@ impl App {
             last_notch: Instant::now(),
             strip_hover: false,
             strip_on: true,
+            queued_tiles: HashSet::new(),
             drag_accum: 0.0,
             menu_at: None,
             thumbs: HashMap::new(),
@@ -286,7 +291,10 @@ impl App {
 
     /// Decode one small tile on the worker pool (never blocks the UI).
     fn queue_thumb(&mut self, path: PathBuf) {
-        if self.thumbs.contains_key(&path) {
+        // ponytail: dedupe on BOTH decoded and in-flight. Checking only
+        // `thumbs` re-spawned every queued tile every frame; the tile pool
+        // (4-8 threads) drowned and tiles past the first few stayed blank.
+        if self.thumbs.contains_key(&path) || !self.queued_tiles.insert(path.clone()) {
             return;
         }
         let tx = self.tile_tx.clone();
