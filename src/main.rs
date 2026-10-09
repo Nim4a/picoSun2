@@ -1,6 +1,9 @@
 //! picoSun2 — Rust photo viewer. Feature port of the picoSun session:
 //! instant-first open, crossfade, wheel paging/zoom, Picasa strip, fullscreen.
 
+// GUI app: no console window flashing behind it when launched from Explorer
+#![windows_subsystem = "windows"]
+
 mod viewer;
 
 fn main() -> eframe::Result {
