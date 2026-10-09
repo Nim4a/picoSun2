@@ -1424,9 +1424,29 @@ impl App {
             self.show_current();
         }
 
-        // preload neighbours: after landing, prev/next tiles decode in the
-        // background so paging feels instant (session: hardware-aware caching)
-        if let Some(p) = self.current().map(|p| p.to_path_buf()) {
+        // preload: decode every tile the strip can actually show right now,
+        // not just the immediate neighbours — at the end of a long folder the
+        // visible window (30 tiles) would otherwise stay blank because only
+        // ±1 around the current index was ever queued.
+        if self.strip_on {
+            let vis_start = start.min(count);
+            let mut vis_end = (vis_start + 1).min(count);
+            let mut xw = area.left() + 8.0;
+            // ponytail: assume average tile width; walk until off-screen right.
+            // Over-queues a couple of tiles — decode is cached, never wasted.
+            const AVG_TILE: f32 = TILE * 0.7;
+            while xw < area.right() && vis_end < count {
+                xw += AVG_TILE + 2.0;
+                vis_end += 1;
+            }
+            for i in vis_start..vis_end {
+                if let Some(n) = self.folder.get(i) {
+                    if !self.thumbs.contains_key(n) {
+                        self.queue_thumb(n.clone());
+                    }
+                }
+            }
+        } else if let Some(p) = self.current().map(|p| p.to_path_buf()) {
             for d in [-1i64, 1] {
                 if let Some(n) = self.folder.get((self.index as i64 + d) as usize) {
                     if !self.thumbs.contains_key(n) {
