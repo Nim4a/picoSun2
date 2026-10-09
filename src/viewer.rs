@@ -26,13 +26,14 @@ const IMAGE_EXTS: &[&str] = &[
     "drf", "eip", "obm", "rwz",
 ];
 
-/// Our own cache sidecars are NOT photos. `img.arw.p2cache.png` ends in
-/// `.png`, so without this the folder scan counts every cached photo twice
-/// and the filmstrip fills with 26MB PNGs instead of real photos.
+/// Cache files live in a hidden `<dir>/.p2cache/` subfolder — anything
+/// inside it is not a photo. The folder scan must skip it or the filmstrip
+/// fills with cached PNGs instead of real photos.
 fn is_cache_sidecar(p: &Path) -> bool {
-    p.file_name()
+    p.parent()
+        .and_then(|d| d.file_name())
         .and_then(|n| n.to_str())
-        .map(|n| n.ends_with(".p2cache.png") || n.ends_with(".p2cache.meta"))
+        .map(|n| n == ".p2cache")
         .unwrap_or(false)
 }
 
@@ -519,20 +520,22 @@ fn spawn_master(
     });
 }
 
-/// The cache lives NEXT TO the photo: `img.arw.p2cache.png` + a `.meta`
-/// sidecar with the source's mtime+len (cheap stdlib stat, no DB). No central
-/// cache dir, no hashing — the user can see, move, and delete a cache entry
-/// alongside its photo.
+/// The cache lives in a hidden subfolder next to the photos:
+/// `<dir>/.p2cache/<filename>.png` + `<dir>/.p2cache/<filename>.meta`.
+/// One hidden folder per photo folder — the photo folder stays clean, and
+/// the whole cache for a folder is one thing to delete or move.
+fn cache_dir(path: &Path) -> std::path::PathBuf {
+    path.parent().unwrap_or(Path::new(".")).join(".p2cache")
+}
+
 fn cache_sidecar(path: &Path) -> std::path::PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".p2cache.png");
-    std::path::PathBuf::from(s)
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    cache_dir(path).join(format!("{}.png", name))
 }
 
 fn cache_meta_sidecar(path: &Path) -> std::path::PathBuf {
-    let mut s = path.as_os_str().to_owned();
-    s.push(".p2cache.meta");
-    std::path::PathBuf::from(s)
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    cache_dir(path).join(format!("{}.meta", name))
 }
 
 /// A cached PNG is only valid while the source file has not changed. Store
@@ -580,6 +583,7 @@ fn save_to_disk_cache(path: &Path, img: &DynamicImage) {
     let p = cache_sidecar(path);
     let mut buf = std::io::Cursor::new(Vec::new());
     if img.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+        let _ = std::fs::create_dir_all(cache_dir(path));
         let _ = std::fs::write(&p, buf.into_inner());
     }
 }
@@ -1750,15 +1754,15 @@ mod decode_tests {
         );
     }
 
-    /// Cache sidecars must never be counted as photos: `IMG_1.JPG.p2cache.png`
-    /// ends in .png, and without the filter the folder scan sees every cached
-    /// photo twice (87 photos → 174 entries, filmstrip half-empty of real art).
+    /// Cache files live in `<dir>/.p2cache/` — anything inside it must never
+    /// be counted as a photo. The .png files inside end in .png, and without
+    /// the filter the folder scan sees every cached photo twice.
     #[test]
     fn cache_sidecar_is_not_an_image() {
         let p = |s: &str| std::path::PathBuf::from(s);
-        assert!(!is_image(&p("IMG_1.JPG.p2cache.png")));
-        assert!(!is_image(&p("IMG_1.JPG.p2cache.meta")));
-        assert!(!is_image(&p("shot.arw.p2cache.png")));
+        assert!(!is_image(&p("photos/.p2cache/IMG_1.JPG.png")));
+        assert!(!is_image(&p("photos/.p2cache/IMG_1.JPG.meta")));
+        assert!(!is_image(&p("photos/.p2cache/shot.arw.png")));
         // real photos still count
         assert!(is_image(&p("IMG_1.JPG")));
         assert!(is_image(&p("shot.arw")));
