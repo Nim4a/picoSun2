@@ -13,7 +13,7 @@ const SETTLE: Duration = Duration::from_millis(220);
 const NOTCH: f32 = 40.0; // egui Options::line_scroll_speed: one wheel notch in points
 const FADE: f32 = 0.18; // crossfade seconds
 const TILE: f32 = 49.0; // Picasa strip tile height
-const BAR: f32 = 17.0; // info bar above the strip
+const BAR: f32 = 24.0; // info bar above the strip
 
 const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "tif", "tiff", "ico",
@@ -139,7 +139,6 @@ pub struct App {
     wheel_points: f32, // strip scroll: accumulate egui's smoothed points, step per notch
     last_notch: Instant,
     strip_hover: bool,
-    debug_logged: bool,
     strip_on: bool,     // Ctrl+T shows/hides the strip (old viewer parity)
     drag_accum: f32,    // pixels dragged this press: click toggles only if tiny
     menu_at: Option<egui::Pos2>, // right-click context menu anchor
@@ -187,7 +186,6 @@ impl App {
             wheel_points: 0.0,
             last_notch: Instant::now(),
             strip_hover: false,
-            debug_logged: false,
             strip_on: true,
             queued_tiles: HashSet::new(),
             drag_accum: 0.0,
@@ -287,30 +285,20 @@ impl App {
 
     fn put_master(&mut self, p: PathBuf, h: egui::TextureHandle) {
         self.master_tex.retain(|(q, _)| q != &p);
-        if self.master_tex.len() >= 8 {
-            let _ = self.master_tex.remove(0); // LRU-8: dropping the handle evicts the texture
+        // LRU-4: each master is a full-res 71MB texture — 8 of them was
+        // 570MB of VRAM. 4 keeps paging back instant without the blowup.
+        if self.master_tex.len() >= 4 {
+            let _ = self.master_tex.remove(0); // dropping the handle evicts the texture
         }
         self.master_tex.push((p, h));
     }
 
     /// Decode one small tile on the worker pool (never blocks the UI).
     fn queue_thumb(&mut self, path: PathBuf) {
-        // ponytail: dedupe on BOTH decoded and in-flight.
+        // ponytail: dedupe on BOTH decoded and in-flight. No logging here —
+        // this runs once per tile per frame during preload, and a file open
+        // per call was costing ~1800 opens/sec on a 87-photo folder.
         if self.thumbs.contains_key(&path) || !self.queued_tiles.insert(path.clone()) {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("Z:\\tmp\\p2_debug_log.txt")
-            {
-                let _ = writeln!(
-                    f,
-                    "P2_DEBUG queue_thumb: SKIP {} thumbs={} queued={}",
-                    path.file_name().unwrap_or_default().to_string_lossy(),
-                    self.thumbs.len(),
-                    self.queued_tiles.len()
-                );
-            }
             return;
         }
         let tx = self.tile_tx.clone();
@@ -321,14 +309,14 @@ impl App {
         static TILE_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
         let pool = TILE_POOL.get_or_init(|| {
             rayon::ThreadPoolBuilder::new()
-                .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()).min(8).max(4))
+                .num_threads(std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(4, 8))
                 .thread_name(|i| format!("p2-tile-{i}"))
                 .build()
                 .expect("tile pool")
         });
         pool.spawn(move || {
-            let img = read_thumb(&path)
-                .map(|im| Arc::new(im.thumbnail((TILE * 3.0) as u32, (TILE * 3.0) as u32)));
+            // read_thumb already returns the 147px preview (and caches it)
+            let img = read_thumb(&path).map(Arc::new);
             let _ = tx.send((path, img.map_err(|e| e.to_string())));
         });
     }
@@ -405,49 +393,20 @@ impl App {
     /// Take tiles and masters off their worker channels; upload as textures.
     fn poll_decode(&mut self, ctx: &egui::Context) {
         while let Ok((path, res)) = self.tile_rx.try_recv() {
-            match res {
-                Ok(img) => {
-                    let tex = upload(ctx, &path, &img);
-                    let is_current = self.current() == Some(path.as_path());
-                    let master_shown = self.tex.as_ref().map_or(false, |t| {
-                        self.master_tex
-                            .iter()
-                            .any(|(p, h)| *p == path && h.id() == t.id())
-                    });
-                    if is_current && !master_shown && self.fade.is_none() {
-                        self.prev_tex = None;
-                        self.tex = Some(tex.clone());
-                    }
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("Z:\\tmp\\p2_debug_log.txt")
-                    {
-                        let _ = writeln!(
-                            f,
-                            "P2_DEBUG poll: OK {} thumbs={}",
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                            self.thumbs.len()
-                        );
-                    }
-                    self.thumbs.insert(path, tex);
+            // a tile that fails to decode is just a grey slot
+            if let Ok(img) = res {
+                let tex = upload(ctx, &path, &img);
+                let is_current = self.current() == Some(path.as_path());
+                let master_shown = self.tex.as_ref().is_some_and(|t| {
+                    self.master_tex
+                        .iter()
+                        .any(|(p, h)| *p == path && h.id() == t.id())
+                });
+                if is_current && !master_shown && self.fade.is_none() {
+                    self.prev_tex = None;
+                    self.tex = Some(tex.clone());
                 }
-                Err(e) => {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("Z:\\tmp\\p2_debug_log.txt")
-                    {
-                        let _ = writeln!(
-                            f,
-                            "P2_DEBUG poll: ERR {} {}",
-                            path.file_name().unwrap_or_default().to_string_lossy(),
-                            e
-                        );
-                    }
-                }
+                self.thumbs.insert(path, tex);
             }
         }
         while let Ok((path, res)) = self.master_rx.try_recv() {
@@ -538,6 +497,15 @@ fn cache_meta_sidecar(path: &Path) -> std::path::PathBuf {
     cache_dir(path).join(format!("{}.meta", name))
 }
 
+/// A tiny 147px preview per photo: `<dir>/.p2cache/<filename>.t.png`.
+/// The strip decodes 30+ tiles at a time; a full decode per tile is
+/// ~490ms on a 24MP JPEG (33s of CPU for an 87-photo folder). A cached
+/// thumb is a 6KB PNG — ~5ms to load.
+fn cache_thumb(path: &Path) -> std::path::PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    cache_dir(path).join(format!("{}.t.png", name))
+}
+
 /// A cached PNG is only valid while the source file has not changed. Store
 /// the source's mtime+len in a sidecar .meta — a cheap stdlib stat() check,
 /// no DB. Source edited after caching → stale entry → fresh demosaic.
@@ -616,11 +584,34 @@ fn read_image(path: &Path) -> Result<DynamicImage, String> {
 /// ponytail: a tile decode is ~400ms (full 5184x3456 → thumbnail) on V:, so
 /// the caller caps the queue and a dedicated 2-thread pool keeps the master
 /// decode fast (see queue_thumb). No downscale here — full-res is served.
+///
+/// The 147px preview is cached on disk: a full JPEG decode per tile costs
+/// ~490ms, so an 87-photo strip burned 33s of CPU on every launch. The
+/// cached PNG is ~6KB and loads in ~5ms.
 fn read_thumb(path: &Path) -> Result<DynamicImage, String> {
-    if is_raw(path) {
-        return read_raw(path, false);
+    let tp = cache_thumb(path);
+    if let Ok(bytes) = std::fs::read(&tp) {
+        if let Ok(img) = image::load_from_memory(&bytes) {
+            if cache_is_fresh(path) {
+                return Ok(img);
+            }
+        }
+        let _ = std::fs::remove_file(&tp); // stale
     }
-    decode_regular(path)
+    let src = if is_raw(path) {
+        read_raw(path, false)?
+    } else {
+        decode_regular(path)?
+    };
+    let thumb = src.thumbnail((TILE * 3.0) as u32, (TILE * 3.0) as u32);
+    // write the preview (best effort — a failed write just means we
+    // decode again next time, never a wrong picture)
+    let mut buf = std::io::Cursor::new(Vec::new());
+    if thumb.write_to(&mut buf, image::ImageFormat::Png).is_ok() {
+        let _ = std::fs::create_dir_all(cache_dir(path));
+        let _ = std::fs::write(&tp, buf.into_inner());
+    }
+    Ok(thumb)
 }
 
 fn decode_regular(path: &Path) -> Result<DynamicImage, String> {
@@ -797,19 +788,38 @@ fn read_raw(path: &Path, smooth: bool) -> Result<DynamicImage, String> {
 
 /// Count frames of a GIF via its logical screen + image descriptors (cheap).
 fn count_frames(path: &Path) -> i64 {
-    // ponytail: header scan only — good enough to enable/disable frame nav
-    match std::fs::read(path) {
-        Ok(b) => b.iter().filter(|&&x| x == 0x21).count() as i64,
-        Err(_) => 1,
+    // ponytail: header scan only — good enough to enable/disable frame nav.
+    // Read the file in chunks instead of all at once: a 30MB GIF was pulled
+    // wholly into memory just to count 0x21 bytes.
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return 1 };
+    let mut buf = [0u8; 64 * 1024];
+    let mut count = 0i64;
+    loop {
+        let n = match f.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        count += buf[..n].iter().filter(|&&x| x == 0x21).count() as i64;
     }
+    count.max(1)
 }
 
+/// RGB→RGBA for the GPU. `ColorImage::from_rgb` converts the RGB source
+/// straight into the texture buffer — `to_rgba8()` would allocate a
+/// separate 71MB RGBA copy first (measured 53ms per 24MP photo, pure waste).
 fn to_color_image(img: &DynamicImage) -> egui::ColorImage {
-    let rgba = img.to_rgba8();
-    egui::ColorImage::from_rgba_unmultiplied(
-        [rgba.width() as _, img.height() as _],
-        rgba.as_raw(),
-    )
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    match img {
+        DynamicImage::ImageRgb8(rgb) => egui::ColorImage::from_rgb([w, h], rgb.as_raw()),
+        DynamicImage::ImageRgba8(rgba) => {
+            egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw())
+        }
+        other => {
+            let r = other.to_rgba8();
+            egui::ColorImage::from_rgba_unmultiplied([w, h], r.as_raw())
+        }
+    }
 }
 
 fn upload(ctx: &egui::Context, path: &Path, img: &DynamicImage) -> egui::TextureHandle {
@@ -824,6 +834,21 @@ fn pixel_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<DynamicImage>
     CELL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Apply the rotate/flip transform to a decoded master. Shared by the
+/// retexture path and the save path so both agree on the result.
+fn apply_xform(img: &DynamicImage, rot: u8, flipped: bool) -> DynamicImage {
+    let mut out = match rot {
+        1 => img.rotate90(),
+        2 => img.rotate180(),
+        3 => img.rotate270(),
+        _ => img.clone(),
+    };
+    if flipped {
+        out = out.fliph();
+    }
+    out
+}
+
 impl App {
     /// Save the current (rot/flip-applied) master to disk, format by extension.
     fn save_current(&mut self) {
@@ -832,16 +857,12 @@ impl App {
             self.error = Some("nothing loaded".into());
             return;
         };
-        let mut img = (*img).clone();
-        match self.rot {
-            1 => img = img.rotate90(),
-            2 => img = img.rotate180(),
-            3 => img = img.rotate270(),
-            _ => {}
-        }
-        if self.flipped {
-            img = img.fliph();
-        }
+        // ponytail: no transform → no clone (53MB copy on a 24MP photo)
+        let img = if self.rot == 0 && !self.flipped {
+            (*img).clone()
+        } else {
+            apply_xform(&img, self.rot, self.flipped)
+        };
         match img.save(&path) {
             Ok(_) => self.error = Some("saved".into()),
             Err(e) => self.error = Some(format!("save failed: {e}")),
@@ -886,16 +907,13 @@ impl App {
     fn retexture(&mut self) {
         let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
         let Some(img) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else { return };
-        let mut img = (*img).clone();
-        match self.rot {
-            1 => img = img.rotate90(),
-            2 => img = img.rotate180(),
-            3 => img = img.rotate270(),
-            _ => {}
-        }
-        if self.flipped {
-            img = img.fliph();
-        }
+        // ponytail: no transform → no clone. Cloning a 24MP DynamicImage is
+        // a 53MB copy on every rotate/flip keypress.
+        let img = if self.rot == 0 && !self.flipped {
+            img
+        } else {
+            Arc::new(apply_xform(&img, self.rot, self.flipped))
+        };
         if let Some(ctx) = self.ctx() {
             self.tex = Some(upload(&ctx, &path, &img));
             self.fade = None;
@@ -914,11 +932,23 @@ impl App {
         let path = self.decoding.clone()?;
         let cache = pixel_cache().lock().ok()?;
         let img = cache.get(&path)?;
-        let rgba = img.to_rgba8();
-        let x = ((rgba.width() as f32 * u) as u32).min(rgba.width() - 1);
-        let y = ((rgba.height() as f32 * v).min(rgba.height() as f32 - 1.0)) as u32;
-        let p = rgba.get_pixel(x as u32, y as u32);
-        Some([p[0], p[1], p[2]])
+        // read the RGB source directly — `to_rgba8()` here allocated a 71MB
+        // buffer to look at ONE pixel.
+        let (w, h) = (img.width(), img.height());
+        let x = ((w as f32 * u) as u32).min(w - 1);
+        let y = ((h as f32 * v) as u32).min(h - 1);
+        let p = match img.as_ref() {
+            DynamicImage::ImageRgb8(rgb) => rgb.get_pixel(x, y).0,
+            DynamicImage::ImageRgba8(rgba) => {
+                let p = rgba.get_pixel(x, y).0;
+                [p[0], p[1], p[2]]
+            }
+            other => {
+                let p = other.to_rgba8().get_pixel(x, y).0;
+                [p[0], p[1], p[2]]
+            }
+        };
+        Some(p)
     }
 }
 
@@ -1004,10 +1034,10 @@ impl eframe::App for App {
             self.strip_on = !self.strip_on; // Ctrl+T toggles the strip
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Equals)) {
-            self.zoom_key(ui_rect(ctx), 1.0, ctx.input(|i| i.pointer.latest_pos()));
+            self.zoom_key(self.photo_area(ui_rect(ctx)), 1.0, ctx.input(|i| i.pointer.latest_pos()));
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
-            self.zoom_key(ui_rect(ctx), -1.0, ctx.input(|i| i.pointer.latest_pos()));
+            self.zoom_key(self.photo_area(ui_rect(ctx)), -1.0, ctx.input(|i| i.pointer.latest_pos()));
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
             self.step(1);
@@ -1021,12 +1051,11 @@ impl eframe::App for App {
         if ctx.input(|i| i.key_pressed(egui::Key::Backspace)) {
             self.step(-1);
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::Home)) {
-            if !self.folder.is_empty() {
+        if ctx.input(|i| i.key_pressed(egui::Key::Home))
+            && !self.folder.is_empty() {
                 self.index = 0;
                 self.show_current();
             }
-        }
         if ctx.input(|i| i.key_pressed(egui::Key::End)) {
             let n = self.folder.len();
             if n > 0 {
@@ -1038,18 +1067,20 @@ impl eframe::App for App {
         // wheel: ON the photo → anchored zoom; over the letterbox, the bottom
         // bar or the strip → page (old viewer rule; strip claims the wheel
         // only once hovered). Ctrl+wheel zooms too (egui's Event::Zoom).
-        let area = ui_rect(ctx);
+        let area = self.photo_area(ui_rect(ctx));
         let img_size = self.tex.as_ref().map(|t| t.size_vec2());
         let photo_rect = img_size.map(|s| fit_rect(area, s, &self.zoom));
         let (wheel_y, pos, strip_hot, drag_delta) =
             ctx.input(|i| (i.smooth_scroll_delta.y, i.pointer.latest_pos(), self.strip_hover, i.pointer.delta()));
         let on_photo = pos.is_some_and(|p| photo_rect.is_some_and(|r| r.contains(p)));
         let ctrl_zoom = ctx.input(|i| i.zoom_delta());
-        if ctrl_zoom != 1.0 && img_size.is_some() {
-            // one event per notch (no frame smoothing): direction is enough
-            let f = if ctrl_zoom > 1.0 { 1.15 } else { 1.0 / 1.15 };
-            let pt = if on_photo { pos.unwrap() } else { area.center() };
-            zoom_step(&mut self.zoom, area, img_size.unwrap(), f, pt);
+        if ctrl_zoom != 1.0 {
+            if let Some(size) = img_size {
+                // one event per notch (no frame smoothing): direction is enough
+                let f = if ctrl_zoom > 1.0 { 1.15 } else { 1.0 / 1.15 };
+                let pt = if on_photo { pos.unwrap() } else { area.center() };
+                zoom_step(&mut self.zoom, area, size, f, pt);
+            }
         }
         if wheel_y != 0.0 {
             if strip_hot || !on_photo {
@@ -1132,7 +1163,7 @@ impl eframe::App for App {
             if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
                 if ctx.input(|i| i.pointer.primary_clicked()) {
                     if let Some(tex) = &self.tex {
-                        let area = ui_rect(ctx);
+                        let area = self.photo_area(ui_rect(ctx));
                         let rect = fit_rect(area, tex.size_vec2(), &self.zoom);
                         if rect.contains(pos) {
                             // map window point → texture pixel
@@ -1245,7 +1276,7 @@ impl eframe::App for App {
             } else if ctx.input(|i| i.pointer.primary_clicked())
                 && ctx
                     .input(|i| i.pointer.hover_pos())
-                    .map_or(false, |p| !rect.contains(p))
+                    .is_some_and(|p| !rect.contains(p))
             {
                 self.menu_at = None; // click outside closes
             }
@@ -1311,21 +1342,30 @@ impl App {
         zoom_step(&mut self.zoom, area, size, f, pt);
     }
 
+    /// The photo's viewport: the window minus the info bar and the filmstrip.
+    ///
+    /// The bars are drawn OVER the window's bottom edge, so fitting the photo
+    /// into the whole window hid its last ~66px behind them — the visible
+    /// photo was cropped, not the letterboxed one. Fit into what is left.
+    fn photo_area(&self, area: egui::Rect) -> egui::Rect {
+        let bars = BAR + if self.strip_on { TILE } else { 0.0 };
+        egui::Rect::from_min_max(area.min, egui::pos2(area.right(), area.bottom() - bars))
+    }
+
     /// One layer: photo floats over nothing; bars draw on top.
     fn paint(&mut self, ui: &mut egui::Ui) {
         let area = ui.max_rect();
-        // Painter is a cheap handle (Arc inside); owning it frees `ui` for
-        // allocate_rect calls later in the same function.
-        let painter = ui.painter().clone();
         // The window owns the mouse everywhere: one fill of alpha 1/255 —
         // invisible over any wallpaper, but hit-tests to us (the old viewer
         // measured 64% of its own window belonging to the browser behind).
+        let painter = ui.painter().clone();
         painter.rect_filled(area, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1));
 
         // photo + crossfade (old fades OUT on top — session rule)
+        let parea = self.photo_area(area);
         if let Some(tex) = self.tex.clone() {
             let size = tex.size_vec2();
-            let rect = fit_rect(area, size, &self.zoom);
+            let rect = fit_rect(parea, size, &self.zoom);
             // soft drop shadow: the photo floats on the letterbox
             for (pad, a) in [(6.0, 60u8), (14.0, 34), (26.0, 16)] {
                 painter.rect_filled(rect.expand(pad), 4.0, egui::Color32::from_black_alpha(a));
@@ -1333,17 +1373,12 @@ impl App {
             let mut tint = egui::Color32::WHITE;
             if let Some(t) = self.fade {
                 let a = ((t.elapsed().as_secs_f32() / FADE).min(1.0) * 255.0) as u8;
-                tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255 - a as u8);
+                tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 255 - a);
             }
             if let Some(prev) = self.prev_tex.clone() {
                 if tint.a() > 0 {
                     let ps = prev.size_vec2();
-                    painter.image(
-                        prev.id(),
-                        fit_rect(area, ps, &self.zoom),
-                        uv(),
-                        tint,
-                    );
+                    painter.image(prev.id(), fit_rect(parea, ps, &self.zoom), uv(), tint);
                 }
             }
             painter.image(tex.id(), rect, uv(), egui::Color32::WHITE);
@@ -1389,7 +1424,17 @@ impl App {
             egui::pos2(area.left(), strip_rect.top() - BAR),
             egui::vec2(area.width(), BAR),
         );
-        painter.rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(24, 25, 28));
+        painter.rect_filled(bar_rect, 0.0, egui::Color32::from_rgb(20, 21, 24));
+        // hairline separating the bar from the photo above it
+        painter.rect_stroke(
+            egui::Rect::from_min_size(
+                bar_rect.left_top(),
+                egui::vec2(bar_rect.width(), 1.0),
+            ),
+            0.0,
+            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(44, 46, 52)),
+            egui::StrokeKind::Inside,
+        );
         if let Some(p) = self.current() {
             let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
             // info: counter (left) · dims + size (center) · name (right)
@@ -1403,26 +1448,28 @@ impl App {
             } else {
                 format!("{} KB", size / 1024)
             };
+            // 12.5px: 11px was unreadable on a 1080p fullscreen window
+            let f = egui::FontId::proportional(12.5);
             painter.text(
-                bar_rect.left_top() + egui::vec2(8.0, BAR / 2.0),
+                bar_rect.left_top() + egui::vec2(12.0, BAR / 2.0),
                 egui::Align2::LEFT_CENTER,
                 format!("{} / {}", self.index + 1, self.folder.len()),
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgb(200, 200, 205),
+                f.clone(),
+                egui::Color32::from_rgb(214, 216, 222),
             );
             painter.text(
                 bar_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 format!("{}  ·  {}", dims, kb),
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgb(150, 152, 158),
+                f.clone(),
+                egui::Color32::from_rgb(138, 141, 149),
             );
             painter.text(
-                bar_rect.right_center() - egui::vec2(8.0, 0.0),
+                bar_rect.right_center() - egui::vec2(12.0, 0.0),
                 egui::Align2::RIGHT_CENTER,
                 &name,
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgb(200, 200, 200),
+                f,
+                egui::Color32::from_rgb(198, 200, 206),
             );
         }
 
@@ -1447,7 +1494,7 @@ impl App {
                 pos += self
                     .thumbs
                     .get(&self.folder[i])
-                    .map(&wid)
+                    .map(wid)
                     .unwrap_or(60.0) + 2.0;
             }
             let cur = self.thumbs.get(&self.folder[self.index]).map(wid).unwrap_or(60.0);
@@ -1469,7 +1516,7 @@ impl App {
                 let mut acc = 0.0;
                 while i > 0 && acc < limit {
                     acc += self.folder.get(i - 1)
-                        .map(|n| self.thumbs.get(n).map(&wid).unwrap_or(60.0) + 2.0)
+                        .map(|n| self.thumbs.get(n).map(wid).unwrap_or(60.0) + 2.0)
                         .unwrap_or(0.0);
                     i -= 1;
                 }
@@ -1490,13 +1537,35 @@ impl App {
                     (w, r)
                 }
                 None => {
+                    // pending tile: a soft slot, not a flat black hole —
+                    // the old flat fill read as a broken strip
                     let r = egui::Rect::from_min_size(egui::pos2(x, strip_rect.top()), egui::vec2(60.0, TILE));
-                    painter.rect_filled(r, 0.0, egui::Color32::from_rgb(26, 27, 30));
+                    painter.rect_filled(r, 0.0, egui::Color32::from_rgb(30, 31, 35));
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 1.0)),
+                        0.0,
+                        egui::Color32::from_rgb(40, 42, 47),
+                    );
                     (60.0, r)
                 }
             };
             if i == self.index {
-                painter.rect_stroke(r, 0.0, egui::Stroke::new(1.5f32, egui::Color32::from_rgb(47, 127, 196)), egui::StrokeKind::Inside);
+                // current tile: a 2px accent bar under it, not a thin ring
+                // that got lost against the photo
+                painter.rect_stroke(
+                    r,
+                    0.0,
+                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(56, 145, 224)),
+                    egui::StrokeKind::Inside,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(r.left(), r.bottom() - 3.0),
+                        egui::pos2(r.right(), r.bottom()),
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(56, 145, 224),
+                );
             }
             let resp = ui.allocate_rect(r, egui::Sense::click());
             if resp.hovered() {
@@ -1534,22 +1603,6 @@ impl App {
             }
             // ponytail: over-queue by 10 — decode is deduped and cached.
             vis_end = (vis_end + 10).min(count);
-            // ponytail: one-shot debug — remove once the fast-scroll bug is closed.
-            if !self.debug_logged {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("Z:\\tmp\\p2_debug_log.txt")
-                {
-                    let _ = writeln!(
-                        f,
-                        "P2_DEBUG preload: index={} count={} start={} vis_start={} vis_end={} thumbs={} queued={}",
-                        self.index, count, start, vis_start, vis_end, self.thumbs.len(), self.queued_tiles.len()
-                    );
-                    self.debug_logged = true;
-                }
-            }
             for i in vis_start..vis_end {
                 if let Some(n) = self.folder.get(i) {
                     if !self.thumbs.contains_key(n) {
