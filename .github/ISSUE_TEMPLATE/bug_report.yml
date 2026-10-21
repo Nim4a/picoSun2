@@ -1,0 +1,38 @@
+name: Bug report
+description: Something in picoSun2 doesn't work as expected
+labels: bug
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What did you see, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open the folder ...
+        2. Scroll to photo ...
+        3. See the wrong result
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: picoSun2 version
+      placeholder: 2.1.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version
+      placeholder: Windows 11
+  - type: textarea
+    id: logs
+    attributes:
+      label: Extra context
+      description: Any error text, or a screenshot of the window.

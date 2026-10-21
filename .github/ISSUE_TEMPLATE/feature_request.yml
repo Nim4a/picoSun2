@@ -1,0 +1,17 @@
+name: Feature request
+description: Suggest a new capability for picoSun2
+labels: enhancement
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like it to do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why is it useful?
+      description: What workflow does it make easier?
+    validations:
+      required: true

@@ -588,15 +588,33 @@ fn read_image(path: &Path) -> Result<DynamicImage, String> {
 /// The 147px preview is cached on disk: a full JPEG decode per tile costs
 /// ~490ms, so an 87-photo strip burned 33s of CPU on every launch. The
 /// cached PNG is ~6KB and loads in ~5ms.
+/// Freshness of the 147px preview. The thumb file's own mtime IS the
+/// stamp — no sidecar. ponytail: it used `cache_is_fresh`, which reads the
+/// `.meta` sidecar that is only written when the MASTER is cached, so every
+/// photo whose master was never opened re-decoded its 24MP JPEG on each
+/// launch (the strip took 40s to fill; now ~0.3s).
+fn thumb_is_fresh(path: &Path) -> bool {
+    let Ok(src) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(t) = std::fs::metadata(cache_thumb(path)) else {
+        return false;
+    };
+    match (src.modified(), t.modified()) {
+        (Ok(s), Ok(tm)) => tm >= s,
+        _ => false,
+    }
+}
+
 fn read_thumb(path: &Path) -> Result<DynamicImage, String> {
     let tp = cache_thumb(path);
     if let Ok(bytes) = std::fs::read(&tp) {
-        if let Ok(img) = image::load_from_memory(&bytes) {
-            if cache_is_fresh(path) {
+        if thumb_is_fresh(path) {
+            if let Ok(img) = image::load_from_memory(&bytes) {
                 return Ok(img);
             }
         }
-        let _ = std::fs::remove_file(&tp); // stale
+        let _ = std::fs::remove_file(&tp); // stale or corrupt
     }
     let src = if is_raw(path) {
         read_raw(path, false)?
@@ -1805,6 +1823,41 @@ mod decode_tests {
             !cache_is_fresh(&src),
             "stale cache after source mtime/len change"
         );
+    }
+
+    /// The 147px preview must be valid on its own — it has no `.meta`
+    /// sidecar, and it must NOT be tied to the master cache. Regression:
+    /// `read_thumb` used `cache_is_fresh`, so a photo whose master was never
+    /// opened re-decoded its full JPEG on every launch.
+    #[test]
+    fn thumb_cache_is_independent_of_the_master_cache() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("p2_thumb_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("tiny.png");
+        let red = DynamicImage::ImageRgb8(image::RgbImage::from_fn(4, 4, |_, _| {
+            image::Rgb([255, 0, 0])
+        }));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        red.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        std::fs::write(&src, buf.into_inner()).unwrap();
+        // no save_cache_meta() here — the master cache was never written
+        let _ = std::fs::create_dir_all(cache_dir(&src));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        red.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        std::fs::write(cache_thumb(&src), buf.into_inner()).unwrap();
+        assert!(
+            thumb_is_fresh(&src),
+            "a fresh thumb is valid without a master cache"
+        );
+        // source touched later → the thumb is stale
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let mut f = std::fs::File::create(&src).unwrap();
+        f.write_all(&red.to_rgba8().as_raw()).unwrap();
+        drop(f);
+        assert!(!thumb_is_fresh(&src), "a thumb older than its source is stale");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cache files live in `<dir>/.p2cache/` — anything inside it must never
