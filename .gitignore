@@ -6,6 +6,6 @@ testdata/*.arw
 *.log
 *.tmp
 
+# only the current installer belongs in the repo — keep the tracked one
+# out of the ignore rules, or git stops tracking updates to it
 
-# only the current installer belongs in the repo
-installer/picoSun2-setup-*.exe
