@@ -42,7 +42,7 @@ A fast, minimal photo viewer for Windows. Built with Rust and egui.
 
 ## Install
 
-Download `picoSun2-setup-2.0.0.exe` from the [latest release](https://github.com/Nim4a/picoSun2/releases/latest).
+Download `picoSun2-setup-2.2.0.exe` from the [latest release](https://github.com/Nim4a/picoSun2/releases/latest).
 
 Or grab the portable `picosun2.exe` directly.
 
@@ -117,7 +117,7 @@ MIT
 
 ### نصب
 
-`picoSun2-setup-2.0.0.exe` را از [آخرین ریلیز](https://github.com/Nim4a/picoSun2/releases/latest) دانلود کنید.
+`picoSun2-setup-2.2.0.exe` را از [آخرین ریلیز](https://github.com/Nim4a/picoSun2/releases/latest) دانلود کنید.
 
 یا مستقیماً `picosun2.exe` قابل‌حمل را بردارید.
 
