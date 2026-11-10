@@ -23,21 +23,29 @@ const CHIP_GAP: f32 = 8.0;
 ///
 /// `update()` needs the same rects to keep photo clicks off the buttons, so
 /// the geometry lives here instead of inside `paint()`.
-fn chip_rects(area: egui::Rect) -> [egui::Rect; 4] {
+fn chip_rects(area: egui::Rect) -> [egui::Rect; 5] {
     let c2 = area.right() - CHIP_GAP - CHIP_W;
     let c1 = c2 - CHIP_GAP - CHIP_W;
+    let c0 = c1 - CHIP_GAP - CHIP_W;
     let y2 = CHIP_GAP * 2.0 + CHIP_H;
     let at = |x: f32, y: f32| {
         egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CHIP_W, CHIP_H))
     };
-    [at(c1, CHIP_GAP), at(c2, CHIP_GAP), at(c1, y2), at(c2, y2)]
+    // [leave-fs, close, rot-ccw, rot-cw, auto-enhance]
+    [
+        at(c1, CHIP_GAP),
+        at(c2, CHIP_GAP),
+        at(c1, y2),
+        at(c2, y2),
+        at(c0, y2),
+    ]
 }
 
 /// Everything the four buttons cover — a click in here is a button, never a
 /// click on the photo underneath it.
 fn chips_rect(area: egui::Rect) -> egui::Rect {
     let r = chip_rects(area);
-    r[0].union(r[3])
+    r[0].union(r[4]).union(r[3])
 }
 
 const IMAGE_EXTS: &[&str] = &[
@@ -159,6 +167,7 @@ pub struct App {
     rot: u8,         // 0/1/2/3 × 90° (R key, session: rotate)
     flipped: bool,   // H key flips horizontally
     frame: usize,    // multi-frame index (GIF etc.)
+    enh: bool,       // auto-enhance on (E key / sun chip) — session, saves baked
     // wheel paging: bank notches during a burst; settle lands the last one
     banked: i32,
     wheel_points: f32, // strip scroll: accumulate egui's smoothed points, step per notch
@@ -222,6 +231,7 @@ impl App {
             master_rx,
             master_tx,
             master_tex: vec![],
+            enh: false,
             info_size: 0,
             last_ctx: None,
         };
@@ -879,6 +889,16 @@ fn pixel_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<DynamicImage>
 
 /// Apply the rotate/flip transform to a decoded master. Shared by the
 /// retexture path and the save path so both agree on the result.
+/// Debug trace: point `P2_TRACE` at a file and every edit action appends a
+/// line there. A GUI-subsystem build has no console, so `eprintln!` is lost.
+fn p2trace(msg: &str) {
+    let Ok(p) = std::env::var("P2_TRACE") else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn apply_xform(img: &DynamicImage, rot: u8, flipped: bool) -> DynamicImage {
     let mut out = match rot {
         1 => img.rotate90(),
@@ -892,23 +912,246 @@ fn apply_xform(img: &DynamicImage, rot: u8, flipped: bool) -> DynamicImage {
     out
 }
 
+/// Auto-enhance: a per-channel 0.4–99.6% percentile stretch (auto levels +
+/// auto white balance), then a gentle S-curve. Histogram is sampled and the
+/// result is one LUT per channel — ~0.3s on a 24MP photo, once per toggle,
+/// never per frame. ponytail: no new crates.
+fn enhance_lut(img: &DynamicImage) -> [u8; 768] {
+    let src = img.to_rgb8();
+    let px = src.as_raw();
+    let n = (src.width() as usize) * (src.height() as usize);
+    let step = if n > 4_000_000 { 7 } else { 3 }; // sample 24MP, don't scan it
+    let mut hist = [[0u32; 256]; 3];
+    let mut i = 0usize;
+    while i < n {
+        let p = &px[i * 3..i * 3 + 3];
+        for c in 0..3 {
+            hist[c][p[c] as usize] += 1;
+        }
+        i += step;
+    }
+    let cut = ((hist[0].iter().sum::<u32>() as f32) * 0.004).max(1.0) as u32;
+    let mut lut = [0u8; 768];
+    for c in 0..3 {
+        let (mut lo, mut hi) = (0usize, 255usize);
+        let mut acc = 0u32;
+        for (v, &n) in hist[c].iter().enumerate() {
+            acc += n;
+            if acc > cut {
+                lo = v;
+                break;
+            }
+        }
+        acc = 0;
+        for (v, &n) in hist[c].iter().enumerate().rev() {
+            acc += n;
+            if acc > cut {
+                hi = v;
+                break;
+            }
+        }
+        if hi <= lo {
+            lo = 0;
+            hi = 255;
+        }
+        let span = (hi - lo) as f32;
+        for v in 0..256 {
+            let t = ((v as f32 - lo as f32) / span).clamp(0.0, 1.0);
+            // gentle S: lifts midtones, keeps both ends anchored
+            let e = t + 0.14 * (2.0 * t * (1.0 - t) - 0.5);
+            lut[c * 256 + v] = (e.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    lut
+}
+
+/// Map every channel of `img` through the enhance LUT, keeping the source's
+/// depth and alpha (a 16-bit RAW master must not drop to 8-bit here).
+fn apply_enhance(img: &DynamicImage) -> DynamicImage {
+    let lut = enhance_lut(img);
+    let m8 = |v: u8, c: usize| lut[c * 256 + v as usize];
+    let m16 = |v: u16, c: usize| lut[c * 256 + (v >> 8) as usize] as u16 * 257;
+    match img {
+        DynamicImage::ImageLuma8(g) => {
+            let mut o = g.clone();
+            for p in o.as_mut() {
+                *p = m8(*p, 0);
+            }
+            DynamicImage::ImageLuma8(o)
+        }
+        DynamicImage::ImageLumaA8(g) => {
+            let mut o = g.clone();
+            for p in o.pixels_mut() {
+                p.0[0] = m8(p.0[0], 0);
+            }
+            DynamicImage::ImageLumaA8(o)
+        }
+        DynamicImage::ImageLuma16(g) => {
+            let mut o = g.clone();
+            for p in o.as_mut() {
+                *p = m16(*p, 0);
+            }
+            DynamicImage::ImageLuma16(o)
+        }
+        DynamicImage::ImageLumaA16(g) => {
+            let mut o = g.clone();
+            for p in o.pixels_mut() {
+                p.0[0] = m16(p.0[0], 0);
+            }
+            DynamicImage::ImageLumaA16(o)
+        }
+        DynamicImage::ImageRgba8(r) => {
+            let mut o = r.clone();
+            for p in o.pixels_mut() {
+                for c in 0..3 {
+                    p.0[c] = m8(p.0[c], c);
+                }
+            }
+            DynamicImage::ImageRgba8(o)
+        }
+        DynamicImage::ImageRgb16(r) => {
+            let mut o = r.clone();
+            for p in o.pixels_mut() {
+                for c in 0..3 {
+                    p.0[c] = m16(p.0[c], c);
+                }
+            }
+            DynamicImage::ImageRgb16(o)
+        }
+        DynamicImage::ImageRgba16(r) => {
+            let mut o = r.clone();
+            for p in o.pixels_mut() {
+                for c in 0..3 {
+                    p.0[c] = m16(p.0[c], c);
+                }
+            }
+            DynamicImage::ImageRgba16(o)
+        }
+        other => {
+            let mut o = other.to_rgb8();
+            for p in o.as_mut().as_chunks_mut::<3>().0 {
+                for (c, b) in p.iter_mut().enumerate() {
+                    *b = m8(*b, c);
+                }
+            }
+            DynamicImage::ImageRgb8(o)
+        }
+    }
+}
+
+/// Write `img` to `target`, format by extension. JPEGs get quality 97 — the
+/// image crate's default (75) would visibly degrade a master that is already
+/// a JPEG, and a save must not cost quality.
+fn save_image(img: &DynamicImage, target: &Path) -> Result<(), String> {
+    let ext = target
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "jpg" | "jpeg" | "jpe" | "jfif") {
+        let f = std::fs::File::create(target).map_err(|e| e.to_string())?;
+        let mut w = std::io::BufWriter::new(f);
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, 97);
+        return enc.encode_image(&img.to_rgb8()).map_err(|e| e.to_string());
+    }
+    img.save(target).map_err(|e| e.to_string())
+}
+
+/// Where a save lands: the file itself when its format can be re-encoded,
+/// else a JPEG sibling — a RAW cannot be written back, and neither can a
+/// format this build has no encoder for.
+fn save_target(path: &Path) -> std::path::PathBuf {
+    let ext = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let encodable = matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "jpe" | "jfif" | "png" | "gif" | "webp" | "bmp" | "dib" | "tif" | "tiff"
+            | "ico" | "tga" | "qoi"
+    );
+    if is_raw(path) || !encodable {
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        return path.with_file_name(format!("{stem}_edited.jpg"));
+    }
+    path.to_path_buf()
+}
+
 impl App {
+    /// Any edit in flight that the on-screen pixels carry (rotate/flip/enhance).
+    fn edits(&self) -> bool {
+        self.rot != 0 || self.flipped || self.enh
+    }
+
+    /// The on-screen pixels: master → rot/flip → auto-enhance.
+    fn bake(&self, img: &DynamicImage) -> DynamicImage {
+        let out = apply_xform(img, self.rot, self.flipped);
+        if self.enh {
+            apply_enhance(&out)
+        } else {
+            out
+        }
+    }
+
     /// Save the current (rot/flip-applied) master to disk, format by extension.
     fn save_current(&mut self) {
         let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
-        let Some(img) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else {
+        let mut src = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned());
+        if src.is_none() {
+            // a save must not die on a cold/evicted cache: decode on demand
+            src = read_image(&path).ok().map(Arc::new);
+        }
+        let Some(img) = src else {
             self.error = Some("nothing loaded".into());
             return;
         };
-        // ponytail: no transform → no clone (53MB copy on a 24MP photo)
-        let img = if self.rot == 0 && !self.flipped {
-            (*img).clone()
+        // ponytail: no edit → no clone (53MB copy on a 24MP photo)
+        let out = if self.edits() {
+            self.bake(&img)
         } else {
-            apply_xform(&img, self.rot, self.flipped)
+            (*img).clone()
         };
-        match img.save(&path) {
-            Ok(_) => self.error = Some("saved".into()),
-            Err(e) => self.error = Some(format!("save failed: {e}")),
+        let target = save_target(&path);
+        p2trace(&format!(
+            "save: rot={} flip={} enh={} {}x{} -> {}",
+            self.rot, self.flipped, self.enh, out.width(), out.height(), target.display()
+        ));
+        match save_image(&out, &target) {
+            Ok(_) => {
+                if target != path {
+                    // RAW/in-place-unwritable: the rotated copy sits beside the
+                    // original and the session keeps its transform on screen
+                    self.error = Some(format!(
+                        "saved {}",
+                        target.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                    return;
+                }
+                // The file on disk IS what was on screen now: adopt those pixels
+                // as the master and drop the in-session transform — otherwise the
+                // next frame would rotate (and re-enhance) a second time.
+                save_to_disk_cache(&path, &out);
+                save_cache_meta(&path);
+                let _ = std::fs::remove_file(cache_thumb(&path)); // strip re-thumbs rotated
+                if let Ok(mut c) = pixel_cache().lock() {
+                    c.insert(path.clone(), Arc::new(out));
+                }
+                self.master_tex.retain(|(q, _)| q != &path);
+                self.rot = 0;
+                self.flipped = false;
+                self.enh = false;
+                self.retexture();
+                self.error = Some("saved".into());
+            }
+            Err(e) => {
+                p2trace(&format!("save failed: {e}"));
+                self.error = Some(format!("save failed: {e}"));
+            }
         }
     }
 
@@ -946,17 +1189,37 @@ impl App {
         self.retexture();
     }
 
-    /// Rebuild the current texture from the cached master with rot/flip.
+    /// Rebuild the current texture from the cached master: rot/flip → enhance.
     fn retexture(&mut self) {
         let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
-        let Some(img) = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned()) else { return };
-        // ponytail: no transform → no clone. Cloning a 24MP DynamicImage is
-        // a 53MB copy on every rotate/flip keypress.
-        let img = if self.rot == 0 && !self.flipped {
-            img
-        } else {
-            Arc::new(apply_xform(&img, self.rot, self.flipped))
+        let mut src = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned());
+        if src.is_none() {
+            // cache miss (evicted, or the master never landed): the disk-cache
+            // PNG is ~150ms, so a rotate still happens instead of silently
+            // doing nothing. ponytail: one decode per rotate, not per frame.
+            p2trace(&format!("retexture: pixel-cache miss for {}", path.display()));
+            src = read_image(&path).ok().map(Arc::new);
+        }
+        let Some(master) = src else {
+            p2trace(&format!("retexture: no pixels for {}", path.display()));
+            return;
         };
+        // ponytail: no edit → no clone. Cloning a 24MP DynamicImage is a 53MB
+        // copy on every rotate/flip/enhance keypress.
+        let img = if self.edits() {
+            Arc::new(self.bake(&master))
+        } else {
+            master
+        };
+        p2trace(&format!(
+            "retexture: rot={} flip={} enh={} -> {}x{} ctx={}",
+            self.rot,
+            self.flipped,
+            self.enh,
+            img.width(),
+            img.height(),
+            self.ctx().is_some()
+        ));
         if let Some(ctx) = self.ctx() {
             self.tex = Some(upload(&ctx, &path, &img));
             self.fade = None;
@@ -1050,10 +1313,17 @@ impl eframe::App for App {
             } else {
                 (self.rot + 1) % 4
             };
+            p2trace(&format!("key R -> rot={} src={}", self.rot, self.current().map(|q| q.display().to_string()).unwrap_or_default()));
             self.retexture();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::H) && i.modifiers.ctrl) {
             self.flipped = !self.flipped;
+            self.retexture();
+        }
+        // E: auto-enhance (sun chip), same non-destructive pipeline as rotate
+        if ctx.input(|i| i.key_pressed(egui::Key::E) && !i.modifiers.ctrl) {
+            self.enh = !self.enh;
+            p2trace(&format!("key E -> enh={}", self.enh));
             self.retexture();
         }
         // one-shot view modes (old nav parity): 0 fit / 1 actual / W width /
@@ -1306,6 +1576,15 @@ impl eframe::App for App {
                         item!(lock_label, self.zoom.locked = !self.zoom.locked);
                         ui.separator();
                         item!("Color picker\tK", self.pick_mode = !self.pick_mode);
+                        let enh_label = if self.enh {
+                            "Auto-enhance: on\tE"
+                        } else {
+                            "Auto-enhance: off\tE"
+                        };
+                        item!(enh_label, {
+                            self.enh = !self.enh;
+                            self.retexture();
+                        });
                         item!("Save\tCtrl+S", self.save_current());
                         ui.separator();
                         let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -1396,16 +1675,32 @@ impl App {
         egui::Rect::from_min_max(area.min, egui::pos2(area.right(), area.bottom() - bars))
     }
 
-    /// The letterbox behind the photo. In windowed mode the window is
-    /// `with_transparent(true)`, so a near-zero alpha keeps the desktop showing
-    /// through. A fullscreen window gets no compositing there and the GL swap
-    /// chain is opaque, so that alpha would come out as pure black — fill it
-    /// with the real backdrop colour instead.
-    fn backdrop(&self, fs: bool) -> egui::Color32 {
+    /// Fullscreen backdrop. Windowed the window is `with_transparent(true)`,
+    /// so a near-zero alpha keeps the desktop showing through. Fullscreen gets
+    /// no compositing there and the GL swap chain is opaque — that alpha comes
+    /// out as pure black, which is what the black-background report was.
+    /// So: stretch the photo's own filmstrip tile over the window with a heavy
+    /// dark tint. Nothing new is uploaded (the tile is already in VRAM) and the
+    /// letterbox becomes a dim, blown-up version of the photo — never a void.
+    fn paint_backdrop(&self, painter: &egui::Painter, area: egui::Rect, fs: bool) {
         if fs {
-            egui::Color32::from_rgb(12, 13, 16)
+            if let Some(t) = self.current().and_then(|p| self.thumbs.get(p)) {
+                let ts = t.size_vec2();
+                if ts.x > 0.0 && ts.y > 0.0 {
+                    let k = (area.width() / ts.x).max(area.height() / ts.y) * 1.08;
+                    let r = egui::Rect::from_center_size(area.center(), ts * k);
+                    painter.image(
+                        t.id(),
+                        r,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::from_rgb(78, 82, 92), // tint ≈ 30% dim, never black
+                    );
+                    return;
+                }
+            }
+            painter.rect_filled(area, 0.0, egui::Color32::from_rgb(12, 13, 16));
         } else {
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1)
+            painter.rect_filled(area, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1));
         }
     }
 
@@ -1417,7 +1712,7 @@ impl App {
         // measured 64% of its own window belonging to the browser behind).
         let painter = ui.painter().clone();
         let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-        painter.rect_filled(area, 0.0, self.backdrop(fs));
+        self.paint_backdrop(&painter, area, fs);
 
         // photo + crossfade (old fades OUT on top — session rule)
         let parea = self.photo_area(area);
@@ -1481,7 +1776,7 @@ impl App {
                     }
                 }
                 // a circular arrow: ccw for 2, cw for 3
-                _ => {
+                2 | 3 => {
                     let dir = if kind == 3 { 1.0f32 } else { -1.0 };
                     let rad = 6.0;
                     let start = -0.5f32;
@@ -1504,14 +1799,31 @@ impl App {
                         egui::Stroke::NONE,
                     ));
                 }
+                // a sun: the auto-enhance toggle
+                _ => {
+                    p.circle_stroke(c, 3.1, s);
+                    for i in 0..8 {
+                        let a = i as f32 * std::f32::consts::TAU / 8.0;
+                        let (dx, dy) = (a.cos(), a.sin());
+                        p.line_segment(
+                            [
+                                egui::pos2(c.x + dx * 5.1, c.y + dy * 5.1),
+                                egui::pos2(c.x + dx * 7.6, c.y + dy * 7.6),
+                            ],
+                            s,
+                        );
+                    }
+                }
             }
         };
-        let chip = |ui: &mut egui::Ui, kind: u8, r: egui::Rect, danger: bool| {
+        let chip = |ui: &mut egui::Ui, kind: u8, r: egui::Rect, danger: bool, on: bool| {
             let resp = ui.allocate_rect(r, egui::Sense::click());
             let fill = if resp.hovered() && danger {
                 egui::Color32::from_rgb(196, 43, 28)
             } else if resp.hovered() {
                 egui::Color32::from_rgb(48, 55, 70)
+            } else if on {
+                egui::Color32::from_rgb(30, 74, 122) // active toggle
             } else {
                 egui::Color32::from_rgba_premultiplied(16, 20, 30, 120)
             };
@@ -1521,28 +1833,38 @@ impl App {
         };
         let cr = chip_rects(area);
         if fs
-            && chip(ui, 1, cr[0], false)
+            && chip(ui, 1, cr[0], false, false)
                 .on_hover_text("Leave fullscreen")
                 .clicked()
         {
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
         }
-        if chip(ui, 0, cr[1], true).on_hover_text("Close").clicked() {
+        if chip(ui, 0, cr[1], true, false).on_hover_text("Close").clicked() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if chip(ui, 2, cr[2], false)
+        if chip(ui, 2, cr[2], false, false)
             .on_hover_text("Rotate left")
             .clicked()
         {
             self.rot = (self.rot + 3) % 4;
+            p2trace(&format!("chip rotate-left -> rot={}", self.rot));
             self.retexture();
         }
-        if chip(ui, 3, cr[3], false)
+        if chip(ui, 3, cr[3], false, false)
             .on_hover_text("Rotate right")
             .clicked()
         {
             self.rot = (self.rot + 1) % 4;
+            p2trace(&format!("chip rotate-right -> rot={}", self.rot));
+            self.retexture();
+        }
+        if chip(ui, 4, cr[4], false, self.enh)
+            .on_hover_text("Auto-enhance (E)")
+            .clicked()
+        {
+            self.enh = !self.enh;
+            p2trace(&format!("chip enhance -> enh={}", self.enh));
             self.retexture();
         }
 
@@ -1587,7 +1909,12 @@ impl App {
             painter.text(
                 bar_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                format!("{}  ·  {}", dims, kb),
+                format!(
+                    "{}  ·  {}{}",
+                    dims,
+                    kb,
+                    if self.enh { "  ·  enhanced" } else { "" }
+                ),
                 f.clone(),
                 egui::Color32::from_rgb(138, 141, 149),
             );
@@ -2063,13 +2390,24 @@ mod decode_tests {
         assert_eq!(cached.width(), img.width());
         assert_eq!(cached.height(), img.height());
         // ponytail: cache benefit guard. A 26MP 15-bit ARW decodes in ~8s; a
-        // cached PNG reload is still a big 65MB read — measured 0.36–1.0s
-        // depending on disk state. Guard at a generous 3s: it still fails if
-        // the cache stops helping, without flaking on a busy disk.
+        // cached PNG reload is still a big 27MB read — measured 0.97s release.
+        // `cargo test` builds debug, where the uninlined `image` PNG decoder
+        // runs ~6x slower (6.0s here) and the demosaic ~9x slower, so both
+        // budgets are profile aware: still catch a real regression, never
+        // flake on a busy debug run.
         let cached_s = t4.duration_since(t3).as_secs_f64();
-        assert!(cached_s < 3.0, "cached load {cached_s:.2}s — too slow to matter");
+        let cache_budget = if cfg!(debug_assertions) { 20.0 } else { 3.0 };
+        assert!(
+            cached_s < cache_budget,
+            "cached load {cached_s:.2}s — too slow to matter"
+        );
         // a 26MP demosaic on one thread is seconds; that is the visible hitch
-        assert!(t2.duration_since(t0).as_secs_f64() < 30.0, "ARW decode absurdly slow");
+        let decode_budget = if cfg!(debug_assertions) { 180.0 } else { 30.0 };
+        let decode_s = t2.duration_since(t0).as_secs_f64();
+        assert!(
+            decode_s < decode_budget,
+            "ARW decode absurdly slow: {decode_s:.1}s"
+        );
     }
 }
 
@@ -2235,5 +2573,66 @@ mod raw_tests {
         println!("thumb: {}x{}", thumb.width(), thumb.height());
         assert!(thumb.width() > 500 && thumb.width() < img.width());
     }
-}
+    #[test]
+    fn enhance_stretches_levels_and_balances_white() {
+        // a photo with no black and no white and a warm cast on every channel
+        let mut img = image::RgbImage::new(64, 64);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let t = (x + y) % 20;
+            *p = image::Rgb([70 + t as u8, 60 + t as u8, 50 + t as u8]);
+        }
+        let out = apply_enhance(&DynamicImage::ImageRgb8(img)).to_rgb8();
+        assert_eq!((out.width(), out.height()), (64, 64), "dims must survive");
+        let (mut lo, mut hi) = (255u8, 0u8);
+        for p in out.pixels() {
+            lo = lo.min(p.0[0]);
+            hi = hi.max(p.0[0]);
+        }
+        assert!(lo < 20 && hi > 235, "levels not stretched: {lo}..{hi}");
+        let mean = |c: usize| {
+            out.pixels().map(|p| p.0[c] as f64).sum::<f64>() / (out.width() * out.height()) as f64
+        };
+        assert!((mean(0) - mean(2)).abs() < 12.0, "WB not balanced");
+    }
 
+    #[test]
+    fn enhance_keeps_sixteen_bit_depth() {
+        let img = DynamicImage::ImageRgb16(image::ImageBuffer::from_pixel(
+            8,
+            8,
+            image::Rgb([8000u16, 20000, 40000]),
+        ));
+        match apply_enhance(&img) {
+            DynamicImage::ImageRgb16(o) => {
+                assert!(o.get_pixel(0, 0).0[0] < 8000, "dark end not lifted");
+            }
+            other => panic!("depth dropped to {:?}", other.color()),
+        }
+    }
+
+    #[test]
+    fn save_target_never_writes_a_raw_in_place() {
+        assert_eq!(
+            save_target(Path::new("C:/x/IMG_1.ARW")),
+            PathBuf::from("C:/x/IMG_1_edited.jpg")
+        );
+        assert_eq!(save_target(Path::new("C:/x/a.JPG")), PathBuf::from("C:/x/a.JPG"));
+        assert_eq!(save_target(Path::new("C:/x/a.png")), PathBuf::from("C:/x/a.png"));
+    }
+
+    #[test]
+    fn save_image_writes_a_jpeg_without_visible_loss() {
+        let dir = std::env::temp_dir().join("p2_enh_test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let out = dir.join("t.jpg");
+        let mut img = image::RgbImage::new(32, 32);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([((x * 3 + y) % 256) as u8, 128, 200]);
+        }
+        save_image(&DynamicImage::ImageRgb8(img), &out).expect("jpeg write");
+        let back = read_image(&out).expect("jpeg read").to_rgb8();
+        let g = back.get_pixel(8, 8).0[1] as i16;
+        assert!((g - 128).abs() <= 3, "q97 changed a flat green: {g}");
+        let _ = std::fs::remove_file(&out);
+    }
+}

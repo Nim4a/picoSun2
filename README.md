@@ -32,9 +32,13 @@ A fast, minimal photo viewer for Windows. Built with Rust and egui.
 - Arrow keys or wheel to page
 - Ctrl+wheel to zoom, drag to pan
 - R to rotate, Ctrl+H to flip
+- E toggles auto-enhance (auto levels + white balance)
 - Ctrl+T toggles the filmstrip
 - F for fullscreen
-- K arms the colour picker, Ctrl+S saves the current view
+- K arms the colour picker, Ctrl+S saves the current view — rotate, flip and
+  enhance are written into the file (a RAW, or a format this build cannot
+  re-encode, saves a rotated `<name>_edited.jpg` beside it)
+- Top-right chips do the same with the mouse: sun = auto-enhance, ↺/↻ = rotate
 
 **Open with**
 - Registered as OpenWith for all photo and RAW formats
@@ -42,7 +46,7 @@ A fast, minimal photo viewer for Windows. Built with Rust and egui.
 
 ## Install
 
-Download `picoSun2-setup-2.2.0.exe` from the [latest release](https://github.com/Nim4a/picoSun2/releases/latest).
+Download `picoSun2-setup-2.3.0.exe` from the [latest release](https://github.com/Nim4a/picoSun2/releases/latest).
 
 Or grab the portable `picosun2.exe` directly.
 
@@ -107,9 +111,14 @@ MIT
 - کلید جهت‌دار یا موس برای جابجایی
 - Ctrl+موس برای زوم، درگ برای پن
 - R چرخش، Ctrl+H آینه افقی
+- E روشن/خاموش کردن بهبود خودکار (تراز خودکار + تعادل سفیدی)
 - Ctrl+T نمایش/مخفی کردن نوار پایین
 - F فول‌اسکرین
-- K انتخاب رنگ، Ctrl+S ذخیرهٔ نمای فعلی
+- K انتخاب رنگ، Ctrl+S ذخیرهٔ نمای فعلی — چرخش، آینه و بهبود داخل خود
+  فایل نوشته میشود (برای RAW یا فرمتی که این ساخت نمیتواند بازنویسی
+  کند، یک فایل `_edited.jpg` چرخیده کنارش ذخیره میشود)
+- دکمههای گوشهٔ بالا-راست همان کار را با موس میکنند: خورشید = بهبود خودکار،
+  ↺/↻ = چرخش
 
 **Open with**
 - به‌عنوان OpenWith برای همهٔ فرمت‌های عکس و RAW ثبت می‌شود
@@ -117,7 +126,7 @@ MIT
 
 ### نصب
 
-`picoSun2-setup-2.2.0.exe` را از [آخرین ریلیز](https://github.com/Nim4a/picoSun2/releases/latest) دانلود کنید.
+`picoSun2-setup-2.3.0.exe` را از [آخرین ریلیز](https://github.com/Nim4a/picoSun2/releases/latest) دانلود کنید.
 
 یا مستقیماً `picosun2.exe` قابل‌حمل را بردارید.
 
