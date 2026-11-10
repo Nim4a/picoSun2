@@ -14,6 +14,31 @@ const NOTCH: f32 = 40.0; // egui Options::line_scroll_speed: one wheel notch in 
 const FADE: f32 = 0.18; // crossfade seconds
 const TILE: f32 = 49.0; // Picasa strip tile height
 const BAR: f32 = 24.0; // info bar above the strip
+const CHIP_W: f32 = 40.0; // floating button, top-right of the window
+const CHIP_H: f32 = 30.0;
+const CHIP_GAP: f32 = 8.0;
+
+/// Geometry of the four floating buttons. Top row: leave fullscreen, close.
+/// Bottom row: rotate counter-clockwise, rotate clockwise.
+///
+/// `update()` needs the same rects to keep photo clicks off the buttons, so
+/// the geometry lives here instead of inside `paint()`.
+fn chip_rects(area: egui::Rect) -> [egui::Rect; 4] {
+    let c2 = area.right() - CHIP_GAP - CHIP_W;
+    let c1 = c2 - CHIP_GAP - CHIP_W;
+    let y2 = CHIP_GAP * 2.0 + CHIP_H;
+    let at = |x: f32, y: f32| {
+        egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(CHIP_W, CHIP_H))
+    };
+    [at(c1, CHIP_GAP), at(c2, CHIP_GAP), at(c1, y2), at(c2, y2)]
+}
+
+/// Everything the four buttons cover — a click in here is a button, never a
+/// click on the photo underneath it.
+fn chips_rect(area: egui::Rect) -> egui::Rect {
+    let r = chip_rects(area);
+    r[0].union(r[3])
+}
 
 const IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "jfif", "png", "gif", "webp", "bmp", "dib", "tif", "tiff", "ico",
@@ -1090,7 +1115,11 @@ impl eframe::App for App {
         let photo_rect = img_size.map(|s| fit_rect(area, s, &self.zoom));
         let (wheel_y, pos, strip_hot, drag_delta) =
             ctx.input(|i| (i.smooth_scroll_delta.y, i.pointer.latest_pos(), self.strip_hover, i.pointer.delta()));
-        let on_photo = pos.is_some_and(|p| photo_rect.is_some_and(|r| r.contains(p)));
+        let on_photo = pos.is_some_and(|p| {
+            // the floating buttons sit over the photo — clicking them is never
+            // a click on the photo
+            photo_rect.is_some_and(|r| r.contains(p)) && !chips_rect(ui_rect(ctx)).contains(p)
+        });
         let ctrl_zoom = ctx.input(|i| i.zoom_delta());
         if ctrl_zoom != 1.0 {
             if let Some(size) = img_size {
@@ -1201,8 +1230,9 @@ impl eframe::App for App {
             }
         }
 
-        // click on the photo: toggle fit ↔ 100%; double-click: leave
-        // fullscreen first, then the same toggle (old viewer parity).
+        // click on the photo: toggle fit ↔ 100%. Double-click leaves
+        // fullscreen wherever it lands — the photo or the empty space around
+        // it; windowed, a double-click on the photo toggles fit as before.
         let dbl = ctx.input(|i| i.pointer.button_double_clicked(egui::PointerButton::Primary));
         let clicked = ctx.input(|i| i.pointer.primary_clicked());
         if (dbl || clicked) && self.menu_at.is_none() {
@@ -1210,12 +1240,8 @@ impl eframe::App for App {
             let tiny_drag = self.drag_accum < 3.0;
             self.drag_accum = 0.0;
             let on = on_photo && !strip_hot; // a strip tile click opens, never toggles
-            if dbl {
-                if fs {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-                } else if on && tiny_drag && !pick_armed {
-                    self.toggle_fit();
-                }
+            if dbl && fs {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             } else if on && tiny_drag && !pick_armed {
                 self.toggle_fit();
             }
@@ -1370,6 +1396,19 @@ impl App {
         egui::Rect::from_min_max(area.min, egui::pos2(area.right(), area.bottom() - bars))
     }
 
+    /// The letterbox behind the photo. In windowed mode the window is
+    /// `with_transparent(true)`, so a near-zero alpha keeps the desktop showing
+    /// through. A fullscreen window gets no compositing there and the GL swap
+    /// chain is opaque, so that alpha would come out as pure black — fill it
+    /// with the real backdrop colour instead.
+    fn backdrop(&self, fs: bool) -> egui::Color32 {
+        if fs {
+            egui::Color32::from_rgb(12, 13, 16)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1)
+        }
+    }
+
     /// One layer: photo floats over nothing; bars draw on top.
     fn paint(&mut self, ui: &mut egui::Ui) {
         let area = ui.max_rect();
@@ -1377,7 +1416,8 @@ impl App {
         // invisible over any wallpaper, but hit-tests to us (the old viewer
         // measured 64% of its own window belonging to the browser behind).
         let painter = ui.painter().clone();
-        painter.rect_filled(area, 0.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 1));
+        let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
+        painter.rect_filled(area, 0.0, self.backdrop(fs));
 
         // photo + crossfade (old fades OUT on top — session rule)
         let parea = self.photo_area(area);
@@ -1412,29 +1452,98 @@ impl App {
             painter.rect_filled(strip_rect, 0.0, egui::Color32::from_rgb(8, 9, 12));
         }
 
-        // floating ⤢ top-right: only in fullscreen; leaves fullscreen, never quits
+        // floating chips, top-right. Row 1: leave fullscreen then close (red
+        // on hover). Row 2: rotate clockwise / counter-clockwise, same chip.
+        // `chips_rect` in `update()` keeps these off the photo.
+        //
+        // The icons are drawn, never typed: the default font has no glyph for
+        // the symbols this started with (`⤢`, and `✕` fell back to a box), and
+        // a missing glyph renders as an empty square.
         let fs = ui.ctx().input(|i| i.viewport().fullscreen.unwrap_or(false));
-        if fs {
-            let btn = egui::Rect::from_min_size(
-                egui::pos2(area.right() - 48.0, 8.0),
-                egui::vec2(40.0, 30.0),
-            );
-            let resp = ui.allocate_rect(btn, egui::Sense::click());
-            painter.rect_filled(btn, 8.0, if resp.hovered() {
+        let icon = |p: &egui::Painter, r: egui::Rect, kind: u8| {
+            let c = r.center();
+            let s = egui::Stroke::new(1.8_f32, egui::Color32::WHITE);
+            match kind {
+                // an X: two crossing strokes
+                0 => {
+                    let d = egui::vec2(6.0, 6.0);
+                    p.line_segment([c - d, c + d], s);
+                    p.line_segment([c + egui::vec2(-d.x, d.y), c + egui::vec2(d.x, -d.y)], s);
+                }
+                // an arrow to each corner: leave fullscreen
+                1 => {
+                    for (dx, dy) in [(1.0f32, -1.0f32), (-1.0, 1.0)] {
+                        let tail = c + egui::vec2(-dx * 3.0, -dy * 3.0);
+                        let tip = c + egui::vec2(dx * 6.5, dy * 6.5);
+                        p.line_segment([tail, tip], s);
+                        p.line_segment([tip, tip + egui::vec2(-dx * 4.0, 0.0)], s);
+                        p.line_segment([tip, tip + egui::vec2(0.0, -dy * 4.0)], s);
+                    }
+                }
+                // a circular arrow: ccw for 2, cw for 3
+                _ => {
+                    let dir = if kind == 3 { 1.0f32 } else { -1.0 };
+                    let rad = 6.0;
+                    let start = -0.5f32;
+                    let sweep = dir * 4.7;
+                    let n = 24;
+                    let pts: Vec<egui::Pos2> = (0..=n)
+                        .map(|i| {
+                            let a = start + sweep * (i as f32 / n as f32);
+                            egui::pos2(c.x + rad * a.cos(), c.y + rad * a.sin())
+                        })
+                        .collect();
+                    p.add(egui::Shape::line(pts, s));
+                    let a = start + sweep;
+                    let tip = egui::pos2(c.x + rad * a.cos(), c.y + rad * a.sin());
+                    let tan = egui::vec2(-a.sin() * dir, a.cos() * dir);
+                    let nrm = egui::vec2(-tan.y, tan.x);
+                    p.add(egui::Shape::convex_polygon(
+                        vec![tip + tan * 4.2, tip + nrm * 3.0, tip - nrm * 3.0],
+                        egui::Color32::WHITE,
+                        egui::Stroke::NONE,
+                    ));
+                }
+            }
+        };
+        let chip = |ui: &mut egui::Ui, kind: u8, r: egui::Rect, danger: bool| {
+            let resp = ui.allocate_rect(r, egui::Sense::click());
+            let fill = if resp.hovered() && danger {
                 egui::Color32::from_rgb(196, 43, 28)
+            } else if resp.hovered() {
+                egui::Color32::from_rgb(48, 55, 70)
             } else {
                 egui::Color32::from_rgba_premultiplied(16, 20, 30, 120)
-            });
-            painter.text(
-                btn.center(),
-                egui::Align2::CENTER_CENTER,
-                "⤢",
-                egui::FontId::proportional(15.0),
-                egui::Color32::WHITE,
-            );
-            if resp.clicked() {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
-            }
+            };
+            painter.rect_filled(r, 8.0, fill);
+            icon(&painter, r, kind);
+            resp
+        };
+        let cr = chip_rects(area);
+        if fs
+            && chip(ui, 1, cr[0], false)
+                .on_hover_text("Leave fullscreen")
+                .clicked()
+        {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        if chip(ui, 0, cr[1], true).on_hover_text("Close").clicked() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if chip(ui, 2, cr[2], false)
+            .on_hover_text("Rotate left")
+            .clicked()
+        {
+            self.rot = (self.rot + 3) % 4;
+            self.retexture();
+        }
+        if chip(ui, 3, cr[3], false)
+            .on_hover_text("Rotate right")
+            .clicked()
+        {
+            self.rot = (self.rot + 1) % 4;
+            self.retexture();
         }
 
         // info bar above (name + counter), thin grey

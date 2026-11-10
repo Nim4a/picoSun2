@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("picoSun2")
             .with_fullscreen(true) // every launch is fullscreen (session rule)
-            .with_transparent(true) // clear glass: desktop shows through
+            .with_transparent(true) // windowed: clear glass, desktop shows through
             .with_icon(icon)
             .with_drag_and_drop(true),
         ..Default::default()
