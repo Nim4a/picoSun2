@@ -44,9 +44,15 @@ A fast, minimal photo viewer for Windows. Built with Rust and egui.
 - Registered as OpenWith for all photo and RAW formats
 - Never hijacks your default apps
 
+## Speed (2.3.1)
+
+- Rotate/flip/enhance bake straight from the master into the screen texture in one blocked pass — a 26MP rotate+enhance went from ~980ms to ~270ms, the enhance toggle from ~190ms to ~105ms.
+- The enhance histogram reads the photo's own bytes instead of building a 78MB RGB copy first; Ctrl+S encodes the master slice directly to JPEG.
+- The in-session pixel cache is capped at 3 photos, so browsing a folder no longer grows memory ~78MB per opened RAW.
+
 ## Install
 
-Download `picoSun2-setup-2.3.0.exe` from the [latest release](https://github.com/Nim4a/picoSun2/releases/latest).
+Download `picoSun2-setup-2.3.1.exe` from the [latest release](https://github.com/Nim4a/picoSun2/releases/latest).
 
 Or grab the portable `picosun2.exe` directly.
 
@@ -124,9 +130,15 @@ MIT
 - به‌عنوان OpenWith برای همهٔ فرمت‌های عکس و RAW ثبت می‌شود
 - هرگز برنامهٔ پیش‌فرض شما را عوض نمی‌کند
 
+## سرعت (۲.۳.۱)
+
+- چرخش/آینه/enhance مستقیم از مستر در یک پاس بلوکی داخل تکسچر صفحه بیک میشود — چرخش+enhance روی ۲۶ مگاپیکسل از ~۹۸۰ms به ~۲۷۰ms و کلید enhance از ~۱۹۰ms به ~۱۰۵ms رسید.
+- هیستوگرام enhance بایتهای خود عکس را میخواند، نه یک کپی ۷۸ مگابایتی RGB؛ Ctrl+S هم برشِ مستر را مستقیم JPEG میکند.
+- کش پیکسل سشن روی ۳ عکس کپ شد، پس گشتن در فولدر دیگر ~۷۸MB به ازای هر RAW بازشده حافظه نمیخورد.
+
 ### نصب
 
-`picoSun2-setup-2.3.0.exe` را از [آخرین ریلیز](https://github.com/Nim4a/picoSun2/releases/latest) دانلود کنید.
+`picoSun2-setup-2.3.1.exe` را از [آخرین ریلیز](https://github.com/Nim4a/picoSun2/releases/latest) دانلود کنید.
 
 یا مستقیماً `picosun2.exe` قابل‌حمل را بردارید.
 

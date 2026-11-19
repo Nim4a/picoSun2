@@ -496,9 +496,7 @@ fn spawn_master(
             Ok(arc) => {
                 let cimg = to_color_image(&arc);
                 // pixel cache first: Color Picker / Save are ready on arrival
-                if let Ok(mut c) = pixel_cache().lock() {
-                    c.insert(path.clone(), arc.clone());
-                }
+                pixel_cache_put(path.clone(), arc.clone());
                 // disk cache: a full-res PNG beside the app (Z:, never C:).
                 // The RAW demosaic is 4s for 26MP; this removes it on the
                 // second open. Cache write failure is ignored — the next
@@ -887,6 +885,25 @@ fn pixel_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, Arc<DynamicImage>
     CELL.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Session pixel cache, capped: a 26MP master is ~78MB, so an uncapped map
+/// reached gigabytes after a few dozen photos in one folder. Callers keep an
+/// Arc, so evicting here can never free pixels that are still on screen.
+fn pixel_cache_put(path: PathBuf, img: Arc<DynamicImage>) {
+    const CAP: usize = 3;
+    static ORDER: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+    let Ok(mut c) = pixel_cache().lock() else { return };
+    let Ok(mut o) = ORDER.lock() else { return };
+    if let Some(i) = o.iter().position(|q| q == &path) {
+        o.remove(i);
+    }
+    o.push(path.clone());
+    c.insert(path.clone(), img);
+    while o.len() > CAP {
+        let old = o.remove(0);
+        c.remove(&old);
+    }
+}
+
 /// Apply the rotate/flip transform to a decoded master. Shared by the
 /// retexture path and the save path so both agree on the result.
 /// Debug trace: point `P2_TRACE` at a file and every edit action appends a
@@ -912,21 +929,122 @@ fn apply_xform(img: &DynamicImage, rot: u8, flipped: bool) -> DynamicImage {
     out
 }
 
+/// Display bake: rotate/flip + enhance straight into a ColorImage, one pass.
+///
+/// The save path needs a DynamicImage because it re-encodes the file, but the
+/// screen only needs RGBA. Routing a rotate through image-crate rotate90 +
+/// apply_enhance + to_color_image copied the same 26MP picture three times per
+/// keypress (~250MB of traffic); this reads each source pixel once.
+fn bake_color(img: &DynamicImage, rot: u8, flipped: bool, enh: bool) -> egui::ColorImage {
+    let lut = if enh { Some(enhance_lut(img)) } else { None };
+    if rot.is_multiple_of(4) && !flipped {
+        return color_image_with_lut(img, lut.as_ref());
+    }
+    let Some(src) = (match img {
+        DynamicImage::ImageRgb8(b) => Some(b.as_raw()),
+        _ => None,
+    }) else {
+        // 16-bit or exotic layout: correctness over speed
+        let d = apply_xform(img, rot, flipped);
+        return color_image_with_lut(&d, lut.as_ref());
+    };
+    let (swi, shi) = (img.width() as usize, img.height() as usize);
+    let (dwi, dhi) = if rot % 2 == 1 { (shi, swi) } else { (swi, shi) };
+    let mut pixels = vec![egui::Color32::BLACK; dwi * dhi];
+    // Blocked so a strided source walk stays inside L1: a 26MP rotate90 is a
+    // transpose, and a naive per-pixel transpose misses cache on every read.
+    const T: usize = 32;
+    for dy0 in (0..dhi).step_by(T) {
+        for dx0 in (0..dwi).step_by(T) {
+            for dy in dy0..(dy0 + T).min(dhi) {
+                let out_row = dy * dwi;
+                for dx in dx0..(dx0 + T).min(dwi) {
+                    let x = if flipped { dwi - 1 - dx } else { dx };
+                    // image crate's rotate90 is clockwise: dest(x,y) <- src(y,h-1-x)
+                    let i = match rot & 3 {
+                        1 => ((shi - 1 - x) * swi + dy) * 3,
+                        2 => ((shi - 1 - dy) * swi + swi - 1 - x) * 3,
+                        3 => (x * swi + swi - 1 - dy) * 3,
+                        _ => (dy * swi + x) * 3,
+                    };
+                    let (mut r, mut g, mut b) = (src[i], src[i + 1], src[i + 2]);
+                    if let Some(l) = &lut {
+                        r = l[r as usize];
+                        g = l[256 + g as usize];
+                        b = l[512 + b as usize];
+                    }
+                    pixels[out_row + dx] = egui::Color32::from_rgb(r, g, b);
+                }
+            }
+        }
+    }
+    egui::ColorImage {
+        size: [dwi, dhi],
+        pixels,
+    }
+}
+
+/// Master bytes -> ColorImage, applying the LUT inline. One sequential read,
+/// one write: this is the pass that used to be `apply_lut_owned` (a full
+/// 72MB clone) followed by a separate `to_color_image` copy.
+fn color_image_with_lut(img: &DynamicImage, lut: Option<&[u8; 768]>) -> egui::ColorImage {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let Some(src) = (match img {
+        DynamicImage::ImageRgb8(b) => Some(b.as_raw()),
+        _ => None,
+    }) else {
+        // 16-bit or exotic layout: correctness over speed
+        let d = match lut {
+            Some(l) => apply_lut_owned(img.clone(), l),
+            None => img.clone(),
+        };
+        return to_color_image(&d);
+    };
+    let mut pixels: Vec<egui::Color32> = Vec::with_capacity(w * h);
+    for p in src.as_chunks::<3>().0 {
+        let (mut r, mut g, mut b) = (p[0], p[1], p[2]);
+        if let Some(l) = lut {
+            r = l[r as usize];
+            g = l[256 + g as usize];
+            b = l[512 + b as usize];
+        }
+        pixels.push(egui::Color32::from_rgb(r, g, b));
+    }
+    egui::ColorImage {
+        size: [w, h],
+        pixels,
+    }
+}
+
 /// Auto-enhance: a per-channel 0.4–99.6% percentile stretch (auto levels +
 /// auto white balance), then a gentle S-curve. Histogram is sampled and the
 /// result is one LUT per channel — ~0.3s on a 24MP photo, once per toggle,
 /// never per frame. ponytail: no new crates.
 fn enhance_lut(img: &DynamicImage) -> [u8; 768] {
-    let src = img.to_rgb8();
-    let px = src.as_raw();
-    let n = (src.width() as usize) * (src.height() as usize);
+    // ponytail: walk the master's own bytes. `to_rgb8()` here allocated a
+    // 78MB copy of a 26MP photo only to fill three 256-bin histograms.
+    let fallback: Vec<u8>;
+    let (px, stride): (&[u8], usize) = match img {
+        DynamicImage::ImageRgb8(b) => (b.as_raw(), 3),
+        DynamicImage::ImageRgba8(b) => (b.as_raw(), 4),
+        DynamicImage::ImageLuma8(b) => (b.as_raw(), 1),
+        other => {
+            fallback = other.to_rgb8().into_raw();
+            (&fallback, 3)
+        }
+    };
+    let n = (img.width() as usize) * (img.height() as usize);
     let step = if n > 4_000_000 { 7 } else { 3 }; // sample 24MP, don't scan it
     let mut hist = [[0u32; 256]; 3];
     let mut i = 0usize;
     while i < n {
-        let p = &px[i * 3..i * 3 + 3];
-        for c in 0..3 {
-            hist[c][p[c] as usize] += 1;
+        let p = &px[i * stride..i * stride + stride];
+        if stride == 1 {
+            hist[0][p[0] as usize] += 1;
+        } else {
+            for (c, &v) in p.iter().take(3).enumerate() {
+                hist[c][v as usize] += 1;
+            }
         }
         i += step;
     }
@@ -965,78 +1083,82 @@ fn enhance_lut(img: &DynamicImage) -> [u8; 768] {
     lut
 }
 
-/// Map every channel of `img` through the enhance LUT, keeping the source's
-/// depth and alpha (a 16-bit RAW master must not drop to 8-bit here).
-fn apply_enhance(img: &DynamicImage) -> DynamicImage {
-    let lut = enhance_lut(img);
+/// In-place variant: the rotate/apply path owns its buffer already, so
+/// enhancing it must not clone it again (53MB per 24MP press).
+#[cfg(test)] // the app goes through apply_lut_owned with a source-based LUT
+fn apply_enhance_owned(img: DynamicImage) -> DynamicImage {
+    let lut = enhance_lut(&img);
+    apply_lut_owned(img, &lut)
+}
+
+/// Apply an already-computed LUT. The LUT always comes from the *source*
+/// master, so rotating a photo can never shift its enhancement (the sampled
+/// pixel set must not depend on the view transform).
+fn apply_lut_owned(mut img: DynamicImage, lut: &[u8; 768]) -> DynamicImage {
     let m8 = |v: u8, c: usize| lut[c * 256 + v as usize];
     let m16 = |v: u16, c: usize| lut[c * 256 + (v >> 8) as usize] as u16 * 257;
-    match img {
-        DynamicImage::ImageLuma8(g) => {
-            let mut o = g.clone();
-            for p in o.as_mut() {
-                *p = m8(*p, 0);
-            }
-            DynamicImage::ImageLuma8(o)
-        }
-        DynamicImage::ImageLumaA8(g) => {
-            let mut o = g.clone();
-            for p in o.pixels_mut() {
-                p.0[0] = m8(p.0[0], 0);
-            }
-            DynamicImage::ImageLumaA8(o)
-        }
-        DynamicImage::ImageLuma16(g) => {
-            let mut o = g.clone();
-            for p in o.as_mut() {
-                *p = m16(*p, 0);
-            }
-            DynamicImage::ImageLuma16(o)
-        }
-        DynamicImage::ImageLumaA16(g) => {
-            let mut o = g.clone();
-            for p in o.pixels_mut() {
-                p.0[0] = m16(p.0[0], 0);
-            }
-            DynamicImage::ImageLumaA16(o)
-        }
-        DynamicImage::ImageRgba8(r) => {
-            let mut o = r.clone();
-            for p in o.pixels_mut() {
-                for c in 0..3 {
-                    p.0[c] = m8(p.0[c], c);
-                }
-            }
-            DynamicImage::ImageRgba8(o)
-        }
-        DynamicImage::ImageRgb16(r) => {
-            let mut o = r.clone();
-            for p in o.pixels_mut() {
-                for c in 0..3 {
-                    p.0[c] = m16(p.0[c], c);
-                }
-            }
-            DynamicImage::ImageRgb16(o)
-        }
-        DynamicImage::ImageRgba16(r) => {
-            let mut o = r.clone();
-            for p in o.pixels_mut() {
-                for c in 0..3 {
-                    p.0[c] = m16(p.0[c], c);
-                }
-            }
-            DynamicImage::ImageRgba16(o)
-        }
-        other => {
-            let mut o = other.to_rgb8();
-            for p in o.as_mut().as_chunks_mut::<3>().0 {
+    let mut handled = true;
+    match &mut img {
+        DynamicImage::ImageRgb8(r) => {
+            for p in r.as_mut().as_chunks_mut::<3>().0 {
                 for (c, b) in p.iter_mut().enumerate() {
                     *b = m8(*b, c);
                 }
             }
-            DynamicImage::ImageRgb8(o)
+        }
+        DynamicImage::ImageRgba8(r) => {
+            for p in r.pixels_mut() {
+                for c in 0..3 {
+                    p.0[c] = m8(p.0[c], c);
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(g) => {
+            for p in g.as_mut() {
+                *p = m8(*p, 0);
+            }
+        }
+        DynamicImage::ImageLumaA8(g) => {
+            for p in g.pixels_mut() {
+                p.0[0] = m8(p.0[0], 0);
+            }
+        }
+        DynamicImage::ImageLuma16(g) => {
+            for p in g.as_mut() {
+                *p = m16(*p, 0);
+            }
+        }
+        DynamicImage::ImageLumaA16(g) => {
+            for p in g.pixels_mut() {
+                p.0[0] = m16(p.0[0], 0);
+            }
+        }
+        DynamicImage::ImageRgb16(r) => {
+            for p in r.pixels_mut() {
+                for c in 0..3 {
+                    p.0[c] = m16(p.0[c], c);
+                }
+            }
+        }
+        DynamicImage::ImageRgba16(r) => {
+            for p in r.pixels_mut() {
+                for c in 0..3 {
+                    p.0[c] = m16(p.0[c], c);
+                }
+            }
+        }
+        _ => handled = false,
+    }
+    if handled {
+        return img;
+    }
+    let mut o = img.to_rgb8();
+    for p in o.as_mut().as_chunks_mut::<3>().0 {
+        for (c, b) in p.iter_mut().enumerate() {
+            *b = m8(*b, c);
         }
     }
+    DynamicImage::ImageRgb8(o)
 }
 
 /// Write `img` to `target`, format by extension. JPEGs get quality 97 — the
@@ -1052,7 +1174,22 @@ fn save_image(img: &DynamicImage, target: &Path) -> Result<(), String> {
         let f = std::fs::File::create(target).map_err(|e| e.to_string())?;
         let mut w = std::io::BufWriter::new(f);
         let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut w, 97);
-        return enc.encode_image(&img.to_rgb8()).map_err(|e| e.to_string());
+        // encode the master's own slice: `to_rgb8()` here copied 78MB of a
+        // 26MP photo just to hand three bytes a pixel to the encoder
+        let (w_, h_) = (img.width(), img.height());
+        let enc_res = match img {
+            DynamicImage::ImageRgb8(r) => {
+                enc.encode(r.as_raw(), w_, h_, image::ExtendedColorType::Rgb8)
+            }
+            DynamicImage::ImageLuma8(l) => {
+                enc.encode(l.as_raw(), w_, h_, image::ExtendedColorType::L8)
+            }
+            DynamicImage::ImageRgba8(r) => {
+                enc.encode(r.as_raw(), w_, h_, image::ExtendedColorType::Rgba8)
+            }
+            other => enc.encode_image(&other.to_rgb8()),
+        };
+        return enc_res.map_err(|e| e.to_string());
     }
     img.save(target).map_err(|e| e.to_string())
 }
@@ -1092,7 +1229,7 @@ impl App {
     fn bake(&self, img: &DynamicImage) -> DynamicImage {
         let out = apply_xform(img, self.rot, self.flipped);
         if self.enh {
-            apply_enhance(&out)
+            apply_lut_owned(out, &enhance_lut(img))
         } else {
             out
         }
@@ -1138,9 +1275,7 @@ impl App {
                 save_to_disk_cache(&path, &out);
                 save_cache_meta(&path);
                 let _ = std::fs::remove_file(cache_thumb(&path)); // strip re-thumbs rotated
-                if let Ok(mut c) = pixel_cache().lock() {
-                    c.insert(path.clone(), Arc::new(out));
-                }
+                pixel_cache_put(path.clone(), Arc::new(out));
                 self.master_tex.retain(|(q, _)| q != &path);
                 self.rot = 0;
                 self.flipped = false;
@@ -1162,9 +1297,7 @@ impl App {
         let w = (img.width() as f32 * factor) as u32;
         let h = (img.height() as f32 * factor) as u32;
         let img = Arc::new(img.resize(w, h, image::imageops::FilterType::Lanczos3));
-        if let Ok(mut c) = pixel_cache().lock() {
-            c.insert(path.clone(), img.clone());
-        }
+        pixel_cache_put(path.clone(), img.clone());
         self.master_tex.retain(|(q, _)| q != &path); // texture cache: stale now
         match img.save(&path) {
             Ok(_) => {
@@ -1191,6 +1324,7 @@ impl App {
 
     /// Rebuild the current texture from the cached master: rot/flip → enhance.
     fn retexture(&mut self) {
+        let t0 = std::time::Instant::now();
         let Some(path) = self.current().map(|p| p.to_path_buf()) else { return };
         let mut src = pixel_cache().lock().ok().and_then(|c| c.get(&path).cloned());
         if src.is_none() {
@@ -1204,24 +1338,25 @@ impl App {
             p2trace(&format!("retexture: no pixels for {}", path.display()));
             return;
         };
-        // ponytail: no edit → no clone. Cloning a 24MP DynamicImage is a 53MB
-        // copy on every rotate/flip/enhance keypress.
-        let img = if self.edits() {
-            Arc::new(self.bake(&master))
+        // Display path: rot/flip/enhance in ONE pass into a ColorImage. Only
+        // the save path pays for a full DynamicImage bake.
+        let cimg = if self.edits() {
+            bake_color(&master, self.rot, self.flipped, self.enh)
         } else {
-            master
+            to_color_image(&master)
         };
         p2trace(&format!(
-            "retexture: rot={} flip={} enh={} -> {}x{} ctx={}",
+            "retexture: rot={} flip={} enh={} -> {}x{} ctx={} {}ms",
             self.rot,
             self.flipped,
             self.enh,
-            img.width(),
-            img.height(),
-            self.ctx().is_some()
+            cimg.size[0],
+            cimg.size[1],
+            self.ctx().is_some(),
+            t0.elapsed().as_millis()
         ));
         if let Some(ctx) = self.ctx() {
-            self.tex = Some(upload(&ctx, &path, &img));
+            self.tex = Some(ctx.load_texture(path.display().to_string(), cimg, Default::default()));
             self.fade = None;
             self.prev_tex = None;
         }
@@ -2581,7 +2716,7 @@ mod raw_tests {
             let t = (x + y) % 20;
             *p = image::Rgb([70 + t as u8, 60 + t as u8, 50 + t as u8]);
         }
-        let out = apply_enhance(&DynamicImage::ImageRgb8(img)).to_rgb8();
+        let out = apply_enhance_owned(DynamicImage::ImageRgb8(img)).to_rgb8();
         assert_eq!((out.width(), out.height()), (64, 64), "dims must survive");
         let (mut lo, mut hi) = (255u8, 0u8);
         for p in out.pixels() {
@@ -2602,7 +2737,7 @@ mod raw_tests {
             8,
             image::Rgb([8000u16, 20000, 40000]),
         ));
-        match apply_enhance(&img) {
+        match apply_enhance_owned(img) {
             DynamicImage::ImageRgb16(o) => {
                 assert!(o.get_pixel(0, 0).0[0] < 8000, "dark end not lifted");
             }
@@ -2634,5 +2769,115 @@ mod raw_tests {
         let g = back.get_pixel(8, 8).0[1] as i16;
         assert!((g - 128).abs() <= 3, "q97 changed a flat green: {g}");
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// The one-pass screen bake must be pixel-identical to the reference path
+    /// (image-crate rotate/flip + enhance + to_color_image).
+    #[test]
+    fn bake_color_matches_the_reference_path() {
+        let mut img = image::RgbImage::new(7, 4);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([
+                (x * 31 + y * 7) as u8,
+                (x * 5 + y * 43) as u8,
+                (x * 17 + y * 11 + 60) as u8,
+            ]);
+        }
+        let img = DynamicImage::ImageRgb8(img);
+        for rot in 0..4u8 {
+            for flipped in [false, true] {
+                for enh in [false, true] {
+                    let want = {
+                        let d = apply_xform(&img, rot, flipped);
+                        let d = if enh { apply_lut_owned(d, &enhance_lut(&img)) } else { d };
+                        to_color_image(&d)
+                    };
+                    let got = bake_color(&img, rot, flipped, enh);
+                    assert_eq!(
+                        (got.size, &got.pixels),
+                        (want.size, &want.pixels),
+                        "rot={rot} flip={flipped} enh={enh}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The LUT must read RGBA masters on their 4-byte stride, not treat the
+    /// alpha bytes as colour (the old code converted to RGB first).
+    #[test]
+    fn enhance_lut_ignores_the_alpha_channel() {
+        let rgb = DynamicImage::ImageRgb8(image::RgbImage::from_fn(6, 6, |x, y| {
+            image::Rgb([(x * 40) as u8, (y * 40) as u8, 120])
+        }));
+        let rgba = DynamicImage::ImageRgba8(image::RgbaImage::from_fn(6, 6, |x, y| {
+            image::Rgba([(x * 40) as u8, (y * 40) as u8, 120, 0])
+        }));
+        assert_eq!(enhance_lut(&rgb), enhance_lut(&rgba));
+    }
+
+    /// Not a correctness gate — a number to quote. Run:
+    /// `cargo test --release perf_bake -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn perf_bake_26mp() {
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(6000, 4000, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, ((x + y) % 239) as u8])
+        }));
+        for (rot, flip) in [(0u8, false), (1u8, false)] {
+            let t = std::time::Instant::now();
+            let _ = bake_color(&img, rot, flip, true);
+            let new = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = bake_color_naive(&img, rot, flip, true);
+            let naive = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = apply_lut_owned(apply_xform(&img, rot, flip), &enhance_lut(&img));
+            let lut_only = t.elapsed();
+            println!(
+                "26MP rot={rot} enh: new {}ms | naive gather {}ms | xform+lut {}ms",
+                new.as_millis(),
+                naive.as_millis(),
+                lut_only.as_millis()
+            );
+        }
+    }
+
+    /// The one-pass gather bake, kept only to benchmark against.
+    #[cfg(test)]
+    fn bake_color_naive(img: &DynamicImage, rot: u8, flipped: bool, enh: bool) -> egui::ColorImage {
+        let (sw, sh) = (img.width(), img.height());
+        let (dw, dh) = if rot % 2 == 1 { (sh, sw) } else { (sw, sh) };
+        let src = match img {
+            DynamicImage::ImageRgb8(b) => b.as_raw(),
+            _ => unimplemented!(),
+        };
+        let lut = if enh { Some(enhance_lut(img)) } else { None };
+        let (swi, shi, dwi) = (sw as usize, sh as usize, dw as usize);
+        let mut pixels = vec![egui::Color32::BLACK; dwi * dh as usize];
+        for dy in 0..dh as usize {
+            let row = dy * dwi;
+            for dx in 0..dwi {
+                let x = if flipped { dwi - 1 - dx } else { dx };
+                let (sx, sy) = match rot & 3 {
+                    1 => (dy, shi - 1 - x),
+                    2 => (swi - 1 - x, shi - 1 - dy),
+                    3 => (swi - 1 - dy, x),
+                    _ => (x, dy),
+                };
+                let i = (sy * swi + sx) * 3;
+                let (mut r, mut g, mut b) = (src[i], src[i + 1], src[i + 2]);
+                if let Some(l) = &lut {
+                    r = l[r as usize];
+                    g = l[256 + g as usize];
+                    b = l[512 + b as usize];
+                }
+                pixels[row + dx] = egui::Color32::from_rgb(r, g, b);
+            }
+        }
+        egui::ColorImage {
+            size: [dwi, dh as usize],
+            pixels,
+        }
     }
 }
